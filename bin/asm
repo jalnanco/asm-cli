@@ -1,0 +1,3962 @@
+#!/bin/zsh
+
+set -euo pipefail
+setopt PIPE_FAIL NULL_GLOB
+unsetopt XTRACE VERBOSE 2>/dev/null || true
+
+ASM_NAME="asm"
+ASM_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/asm"
+ASM_DB="$ASM_HOME/meta.sqlite"
+ASM_EXPORT_DIR="$ASM_HOME/exports"
+ASM_ITERM_LAYOUT_DIR="$ASM_HOME/iterm-layouts"
+ASM_ITERM_SCAN_TIMEOUT="${ASM_ITERM_SCAN_TIMEOUT:-0.35}"
+ASM_ITERM_RESTORE_DELAY="${ASM_ITERM_RESTORE_DELAY:-0.1}"
+ASM_NOW_EPOCH="${EPOCHSECONDS:-$(date +%s)}"
+ASM_MAX_SESSIONS="${ASM_MAX_SESSIONS:-100}"
+ASM_CACHE_TTL_SECONDS="${ASM_CACHE_TTL_SECONDS:-15}"
+ASM_SESSION_CACHE_FILE="$ASM_HOME/session-cache.json"
+ASM_CODEX_FILE_CACHE="$ASM_HOME/codex-file-cache.json"
+ASM_CLAUDE_PROJECT_CACHE="$ASM_HOME/claude-project-cache.json"
+ASM_SCRIPT_PATH="${(%):-%x}"
+[[ -n "$ASM_SCRIPT_PATH" ]] || ASM_SCRIPT_PATH="$0"
+ASM_SCRIPT_PATH="${ASM_SCRIPT_PATH:A}"
+ASM_RUNTIME_PY="${ASM_SCRIPT_PATH:h}/asm_runtime.py"
+ASM_SELFTEST_PY="${ASM_SCRIPT_PATH:h}/asm_selftest.py"
+if [[ ! -f "$ASM_SELFTEST_PY" && -f "${ASM_SCRIPT_PATH:h:h}/tests/asm_selftest.py" ]]; then
+  ASM_SELFTEST_PY="${ASM_SCRIPT_PATH:h:h}/tests/asm_selftest.py"
+fi
+
+debug_log() {
+  [[ -n "${ASM_DEBUG:-}" ]] || return 0
+  mkdir -p "$ASM_HOME"
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$ASM_HOME/asm.log"
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+color_enabled() {
+  [[ -n "${ASM_FORCE_COLOR:-}" ]] && return 0
+  [[ -n "${NO_COLOR:-}" ]] && return 1
+  [[ "${CLICOLOR_FORCE:-0}" != "0" ]] && return 0
+  [[ -t 1 ]] || return 1
+  [[ "${TERM:-}" != "dumb" ]]
+}
+
+runtime_helper_exists() {
+  [[ -f "$ASM_RUNTIME_PY" ]]
+}
+
+selftest_helper_exists() {
+  [[ -f "$ASM_SELFTEST_PY" ]]
+}
+
+run_runtime_py() {
+  if ! runtime_helper_exists; then
+    print -u2 -- "runtime helper not found: $ASM_RUNTIME_PY"
+    print -u2 -- "asm requires asm_runtime.py next to the main script for list/picker/runtime features."
+    return 1
+  fi
+  python3 "$ASM_RUNTIME_PY" "$@"
+}
+
+shell_integration_active() {
+  [[ -n "${ASM_CMD_FILE:-}" ]]
+}
+
+shell_mode_label() {
+  if shell_integration_active; then
+    print -r -- "integrated"
+  else
+    print -r -- "child-shell"
+  fi
+}
+
+file_mtime_epoch() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  stat -f '%m' "$path" 2>/dev/null
+}
+
+cache_is_fresh() {
+  local path="$1"
+  local ttl="${2:-$ASM_CACHE_TTL_SECONDS}"
+  local mtime
+  mtime="$(file_mtime_epoch "$path" 2>/dev/null)" || return 1
+  (( ASM_NOW_EPOCH - mtime < ttl ))
+}
+
+sqlite3_cmd() {
+  command sqlite3 -cmd '.timeout 2000' "$@"
+}
+
+run_osascript_script() {
+  local timeout="${1:-2}"
+  local tmp_script
+  tmp_script="$(mktemp)"
+  cat >"$tmp_script"
+  python3 - "$timeout" "$tmp_script" <<'PY'
+import pathlib
+import subprocess
+import sys
+
+timeout = float(sys.argv[1])
+script_path = pathlib.Path(sys.argv[2])
+script = script_path.read_text(encoding="utf-8")
+try:
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    sys.exit(proc.returncode)
+except subprocess.TimeoutExpired:
+    sys.stderr.write("osascript timed out\n")
+    sys.exit(124)
+PY
+  local rc=$?
+  rm -f "$tmp_script"
+  return "$rc"
+}
+
+iterm_installed() {
+  open -Ra iTerm >/dev/null 2>&1 || open -Ra iTerm2 >/dev/null 2>&1
+}
+
+iterm_running() {
+  command_exists pgrep && pgrep -x iTerm2 >/dev/null 2>&1
+}
+
+iterm_window_count() {
+  if ! iterm_running; then
+    print -r -- "0"
+    return 0
+  fi
+  run_osascript_script "$ASM_ITERM_SCAN_TIMEOUT" <<'APPLESCRIPT' 2>/dev/null || return 1
+tell application "iTerm2"
+  return (count of windows) as string
+end tell
+APPLESCRIPT
+}
+
+iterm_apple_events_ok() {
+  [[ "$(run_osascript_script "$ASM_ITERM_SCAN_TIMEOUT" <<'APPLESCRIPT' 2>/dev/null || true
+tell application "iTerm2"
+  return "ok"
+end tell
+APPLESCRIPT
+)" == "ok" ]]
+}
+
+ensure_iterm_automation_ready() {
+  if ! iterm_installed; then
+    print -u2 -- "iTerm2 is not installed"
+    return 1
+  fi
+  if ! iterm_apple_events_ok; then
+    print -u2 -- "Apple Events to iTerm2 are unavailable"
+    return 1
+  fi
+}
+
+ensure_storage() {
+  mkdir -p "$ASM_HOME" "$ASM_EXPORT_DIR" "$ASM_ITERM_LAYOUT_DIR"
+  sqlite3_cmd "$ASM_DB" <<'SQL' >/dev/null
+CREATE TABLE IF NOT EXISTS session_meta (
+  agent TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  alias TEXT NOT NULL DEFAULT '',
+  last_opened_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (agent, session_id)
+);
+CREATE TABLE IF NOT EXISTS tabs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS tab_sessions (
+  agent TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  tab_id INTEGER NOT NULL,
+  PRIMARY KEY (agent, session_id),
+  FOREIGN KEY (tab_id) REFERENCES tabs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS session_tags (
+  agent TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (agent, session_id, tag)
+);
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+SQL
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+sql_escape() {
+  local s="$1"
+  s="${s//\'/\'\'}"
+  print -r -- "$s"
+}
+
+clean_text() {
+  printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/\\n/ /g; s/\\t/ /g; s/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
+}
+
+truncate_text() {
+  local text
+  text="$(clean_text "$1")"
+  local max_len="${2:-80}"
+  if (( ${#text} > max_len )); then
+    printf '%s...' "${text[1,max_len-3]}"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+short_relative_time() {
+  local epoch="${1:-0}"
+  if [[ -z "$epoch" || "$epoch" == "null" ]]; then
+    print -r -- "-"
+    return 0
+  fi
+
+  local diff=$(( ASM_NOW_EPOCH - epoch ))
+  (( diff < 0 )) && diff=0
+
+  if (( diff < 60 )); then
+    print -r -- "${diff}s"
+  elif (( diff < 3600 )); then
+    print -r -- "$(( diff / 60 ))m"
+  elif (( diff < 86400 )); then
+    print -r -- "$(( diff / 3600 ))h"
+  elif (( diff < 2592000 )); then
+    print -r -- "$(( diff / 86400 ))d"
+  else
+    print -r -- "$(( diff / 2592000 ))mo"
+  fi
+}
+
+agent_label() {
+  case "$1" in
+    codex) print -r -- "CDX" ;;
+    claude) print -r -- "CLD" ;;
+    opencode) print -r -- "OPN" ;;
+    cursor-agent) print -r -- "CUR" ;;
+    gemini) print -r -- "GEM" ;;
+    *) print -r -- "${1:u}" ;;
+  esac
+}
+
+colorize_text() {
+  local code="$1"
+  local text="$2"
+  if color_enabled; then
+    printf '\033[%sm%s\033[0m' "$code" "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+agent_badge() {
+  local label="$2"
+  case "$1" in
+    codex) colorize_text '38;5;75' "$label" ;;
+    claude) colorize_text '38;5;179' "$label" ;;
+    opencode) colorize_text '38;5;71' "$label" ;;
+    cursor-agent) colorize_text '38;5;110' "$label" ;;
+    gemini) colorize_text '38;5;141' "$label" ;;
+    *) colorize_text '38;5;245' "$label" ;;
+  esac
+}
+
+pin_badge() {
+  local text="$1"
+  if [[ "$text" == "PIN" ]]; then
+    colorize_text '1;38;5;203' "$text"
+  else
+    colorize_text '38;5;240' "$text"
+  fi
+}
+
+muted_text() {
+  colorize_text '38;5;244' "$1"
+}
+
+project_label() {
+  local cwd="${1:-}"
+  if [[ -z "$cwd" || "$cwd" == "/" ]]; then
+    print -r -- "/"
+  elif [[ "$cwd" == "$HOME" ]]; then
+    print -r -- "~"
+  else
+    print -r -- "${cwd:t}"
+  fi
+}
+
+list_tab_names() {
+  print -r -- "All"
+  sqlite3_cmd "$ASM_DB" "SELECT name FROM tabs ORDER BY sort_order ASC, name ASC;" 2>/dev/null || true
+}
+
+get_active_tab_name() {
+  local active
+  active="$(sqlite3_cmd "$ASM_DB" "SELECT value FROM app_state WHERE key = 'active_tab';" 2>/dev/null || true)"
+  if [[ -n "$active" && "$active" == "All" ]]; then
+    print -r -- "$active"
+  elif [[ -n "$active" ]]; then
+    local exists
+    exists="$(sqlite3_cmd "$ASM_DB" "SELECT COUNT(*) FROM tabs WHERE name = '$(sql_escape "$active")';" 2>/dev/null || print 0)"
+    if [[ "$exists" != "0" ]]; then
+      print -r -- "$active"
+      return 0
+    fi
+    print -r -- "All"
+  else
+    print -r -- "All"
+  fi
+}
+
+set_active_tab_name() {
+  local tab_name="$1"
+  local esc
+  esc="$(sql_escape "$tab_name")"
+  sqlite3_cmd "$ASM_DB" "
+    INSERT INTO app_state (key, value)
+    VALUES ('active_tab', '${esc}')
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  " >/dev/null
+}
+
+create_tab() {
+  local tab_name="$1"
+  local esc
+  esc="$(sql_escape "$tab_name")"
+  sqlite3_cmd "$ASM_DB" "
+    INSERT INTO tabs (name, sort_order, created_at)
+    VALUES (
+      '${esc}',
+      COALESCE((SELECT MAX(sort_order) + 1 FROM tabs), 1),
+      strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    )
+    ON CONFLICT(name) DO NOTHING
+  " >/dev/null
+}
+
+choose_tab_name() {
+  local prompt="${1:-tab> }"
+  {
+    printf '+new\n'
+    list_tab_names
+  } | fzf \
+        --height=40% \
+        --layout=reverse \
+        --border \
+        --margin=15%,20% \
+        --prompt="$prompt" \
+        --header='Move selected session(s) to which tab?'
+}
+
+choose_tab_action() {
+  {
+    printf 'move\t탭이동\t선택한 세션을 다른 탭으로 이동\n'
+    printf 'new\t새 탭 생성\t선택한 세션으로 새 탭을 만들고 이동\n'
+    printf 'clear\t탭에서 빼기\t선택한 세션을 현재 탭 그룹에서 제거\n'
+  } | fzf \
+        --height=32% \
+        --layout=reverse \
+        --border \
+        --margin=18%,22% \
+        --delimiter=$'\t' \
+        --with-nth=2.. \
+        --prompt='tab-action> ' \
+        --header='Tab key action'
+}
+
+picker_state_write() {
+  local state_file="$1"
+  local mode="$2"
+  shift 2
+  {
+    print -r -- "$mode"
+    local ref
+    for ref in "$@"; do
+      [[ -n "$ref" ]] || continue
+      print -r -- "$ref"
+    done
+  } >"$state_file"
+}
+
+picker_state_mode() {
+  local state_file="$1"
+  [[ -f "$state_file" ]] || {
+    print -r -- "session"
+    return 0
+  }
+  head -n 1 "$state_file" 2>/dev/null | tr -d '\r'
+}
+
+picker_state_refs() {
+  local state_file="$1"
+  [[ -f "$state_file" ]] || return 0
+  tail -n +2 "$state_file" 2>/dev/null
+}
+
+picker_tab_target_rows() {
+  printf '%s\t%s\n' '__tab_target__:__pin_on__' 'Pin selected'
+  printf '%s\t%s\n' '__tab_target__:__pin_off__' 'Unpin selected'
+  printf '%s\t%s\n' '__tab_target__:All' 'All'
+  printf '%s\t%s\n' '__tab_target__:+new' '+new'
+  while IFS= read -r tab; do
+    [[ -n "$tab" && "$tab" != "All" ]] || continue
+    printf '__tab_target__:%s\t%s\n' "$tab" "$tab"
+  done < <(list_tab_names)
+}
+
+prompt_tab_name() {
+  print -n -- "Tab name: " >/dev/tty
+  local name
+  IFS= read -r name </dev/tty || true
+  print -r -- "$name"
+}
+
+assign_ref_to_tab() {
+  local ref="$1"
+  local tab_name="$2"
+  local agent="${ref%%:*}"
+  local session_id="${ref#*:}"
+  local tab_esc agent_esc id_esc
+  tab_esc="$(sql_escape "$tab_name")"
+  agent_esc="$(sql_escape "$agent")"
+  id_esc="$(sql_escape "$session_id")"
+
+  create_tab "$tab_name"
+
+  sqlite3_cmd "$ASM_DB" "
+    INSERT INTO tab_sessions (agent, session_id, tab_id)
+    VALUES (
+      '${agent_esc}',
+      '${id_esc}',
+      (SELECT id FROM tabs WHERE name = '${tab_esc}')
+    )
+    ON CONFLICT(agent, session_id) DO UPDATE SET
+      tab_id = excluded.tab_id
+  " >/dev/null
+}
+
+remove_ref_from_tab() {
+  local ref="$1"
+  local agent="${ref%%:*}"
+  local session_id="${ref#*:}"
+  local agent_esc id_esc
+  agent_esc="$(sql_escape "$agent")"
+  id_esc="$(sql_escape "$session_id")"
+  sqlite3_cmd "$ASM_DB" "
+    DELETE FROM tab_sessions
+    WHERE agent = '${agent_esc}' AND session_id = '${id_esc}'
+  " >/dev/null
+}
+
+tab_count_from_cache() {
+  local cache_file="$1"
+  local tab_name="$2"
+  [[ -f "$cache_file" ]] || return 1
+  if [[ "$tab_name" == "All" ]]; then
+    jq -r 'length' "$cache_file" 2>/dev/null
+  else
+    jq -r --arg tab_name "$tab_name" '[ .[] | select((.tab_name // "") == $tab_name) ] | length' "$cache_file" 2>/dev/null
+  fi
+}
+
+build_tab_header() {
+  local active_tab="$1"
+  local cache_file="${2:-${ASM_CACHE_FILE:-$ASM_SESSION_CACHE_FILE}}"
+  local out="" tab count label styled
+  while IFS= read -r tab; do
+    [[ -n "$tab" ]] || continue
+    if [[ -f "$cache_file" ]]; then
+      count="$(tab_count_from_cache "$cache_file" "$tab" 2>/dev/null || print 0)"
+    elif [[ "$tab" == "All" ]]; then
+      count="$(sqlite3_cmd "$ASM_DB" "SELECT COUNT(*) FROM session_meta;" 2>/dev/null || print 0)"
+    else
+      count="$(sqlite3_cmd "$ASM_DB" "
+        SELECT COUNT(*)
+        FROM tab_sessions ts
+        JOIN tabs t ON t.id = ts.tab_id
+        WHERE t.name = '$(sql_escape "$tab")'
+      " 2>/dev/null || print 0)"
+    fi
+    if [[ "$tab" == "$active_tab" ]]; then
+      label="${tab}:${count}"
+    else
+      label="${tab}"
+    fi
+    if [[ "$tab" == "$active_tab" ]]; then
+      styled="$(colorize_text '1;38;5;16;48;5;81' " $label ")"
+    else
+      styled="$(colorize_text '38;5;246' " $label ")"
+    fi
+    if [[ -n "$out" ]]; then
+      out+="$(colorize_text '38;5;240' ' | ')"
+    fi
+    out+="$styled"
+  done < <(list_tab_names)
+  print -r -- "$out"
+}
+
+picker_header_text() {
+  local active_tab="${1:-All}"
+  local cache_file="${2:-${ASM_CACHE_FILE:-$ASM_SESSION_CACHE_FILE}}"
+  local tab_header
+  tab_header="$(build_tab_header "$active_tab" "$cache_file")"
+  printf '%s' "TABS: $tab_header"
+}
+
+tag_ref_interactive() {
+  local cache_file="$1"
+  local ref="$2"
+  while true; do
+    local current_tags selection
+    current_tags="$(list_ref_tags "$ref")"
+    selection="$(
+      {
+        printf '+new\tCreate new tag\n'
+        printf '-clear\tRemove all tags from this session\n'
+        {
+          print -r -- "$current_tags"
+          list_all_tags
+        } | awk 'NF {seen[$0]=1} END {for (k in seen) print k}' | sort | while IFS= read -r tag; do
+          [[ -n "$tag" ]] || continue
+          if print -r -- "$current_tags" | rg -Fxq "$tag"; then
+            printf '%s\t[x] %s\n' "$tag" "$tag"
+          else
+            printf '%s\t[ ] %s\n' "$tag" "$tag"
+          fi
+        done
+      } | fzf \
+            --height=12 \
+            --layout=reverse \
+            --border \
+            --delimiter=$'\t' \
+            --with-nth=2.. \
+            --prompt='tag> ' \
+            --header="Toggle tags for $ref"
+    )" || return 1
+
+    selection="${selection%%$'\t'*}"
+    case "$selection" in
+      +new)
+        local new_tag
+        new_tag="$(prompt_tag_name)"
+        [[ -n "$new_tag" ]] || continue
+        toggle_tag_in_cache "$cache_file" "$ref" "$new_tag"
+        ;;
+      -clear)
+        while IFS= read -r tag; do
+          [[ -n "$tag" ]] || continue
+          toggle_tag_in_cache "$cache_file" "$ref" "$tag"
+        done <<<"$current_tags"
+        ;;
+      *)
+        [[ -n "$selection" ]] || continue
+        toggle_tag_in_cache "$cache_file" "$ref" "$selection"
+        ;;
+    esac
+  done
+}
+
+shift_tab_name() {
+  local current="$1"
+  local direction="$2"
+  local tabs=()
+  local idx=1 target=1
+  while IFS= read -r tab; do
+    [[ -n "$tab" ]] || continue
+    tabs+=("$tab")
+  done < <(list_tab_names)
+  (( ${#tabs[@]} > 0 )) || {
+    print -r -- "All"
+    return 0
+  }
+  for i in {1..${#tabs[@]}}; do
+    if [[ "${tabs[$i]}" == "$current" ]]; then
+      idx="$i"
+      break
+    fi
+  done
+  if [[ "$direction" == "left" ]]; then
+    target=$(( idx - 1 ))
+    (( target < 1 )) && target=${#tabs[@]}
+  else
+    target=$(( idx + 1 ))
+    (( target > ${#tabs[@]} )) && target=1
+  fi
+  print -r -- "${tabs[$target]}"
+}
+
+toggle_ref_tag() {
+  local ref="$1"
+  local tag="$2"
+  local agent="${ref%%:*}"
+  local session_id="${ref#*:}"
+  local agent_esc id_esc tag_esc
+  agent_esc="$(sql_escape "$agent")"
+  id_esc="$(sql_escape "$session_id")"
+  tag_esc="$(sql_escape "$tag")"
+
+  sqlite3_cmd "$ASM_DB" "
+    DELETE FROM session_tags
+    WHERE agent='${agent_esc}' AND session_id='${id_esc}' AND tag='${tag_esc}';
+    INSERT INTO session_tags (agent, session_id, tag, created_at)
+    SELECT '${agent_esc}', '${id_esc}', '${tag_esc}', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE changes() = 0;
+  " >/dev/null
+}
+
+list_ref_tags() {
+  local ref="$1"
+  local agent="${ref%%:*}"
+  local session_id="${ref#*:}"
+  local agent_esc id_esc
+  agent_esc="$(sql_escape "$agent")"
+  id_esc="$(sql_escape "$session_id")"
+  sqlite3_cmd "$ASM_DB" "
+    SELECT tag
+    FROM session_tags
+    WHERE agent='${agent_esc}' AND session_id='${id_esc}'
+    ORDER BY tag ASC
+  " 2>/dev/null || true
+}
+
+list_all_tags() {
+  sqlite3_cmd "$ASM_DB" "
+    SELECT tag
+    FROM session_tags
+    GROUP BY tag
+    ORDER BY COUNT(*) DESC, tag ASC
+  " 2>/dev/null || true
+}
+
+prompt_tag_name() {
+  print -n -- "Tag name: " >/dev/tty
+  local name
+  IFS= read -r name </dev/tty || true
+  name="${name#\#}"
+  print -r -- "$name"
+}
+
+copy_to_clipboard() {
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$1" | pbcopy
+  fi
+}
+
+notice() {
+  if [[ -t 1 ]]; then
+    print -r -- "$1" >/dev/tty
+  fi
+}
+
+emit_shell_cmd() {
+  local cmd="$1"
+  if [[ -n "${ASM_CMD_FILE:-}" ]]; then
+    print -r -- "$cmd" >"$ASM_CMD_FILE"
+  elif [[ "$cmd" == cd\ *'&& '* || "$cmd" == command\ asm\ __* ]]; then
+    notice "shell integration inactive; running action in child shell"
+    eval "$cmd"
+  elif [[ "$cmd" == cd\ * ]]; then
+    notice "shell integration inactive; cannot persist cd in current shell"
+    print -r -- "$cmd"
+  else
+    notice "shell integration inactive; running action in child shell"
+    eval "$cmd"
+  fi
+}
+
+split_ref() {
+  local ref="$1"
+  print -r -- "${ref%%:*}" "${ref#*:}"
+}
+
+is_tab_ref() {
+  [[ "$1" == __tab__:* ]]
+}
+
+tab_name_from_ref() {
+  local ref="$1"
+  print -r -- "${ref#__tab__:}"
+}
+
+find_codex_session_file() {
+  local session_id="$1"
+  run_runtime_py codex-file-path "$HOME" "$session_id" "$ASM_CODEX_FILE_CACHE"
+}
+
+find_claude_session_file() {
+  local session_id="$1"
+  find "$HOME/.claude/projects" -type f -name "${session_id}.jsonl" 2>/dev/null | head -n 1
+}
+
+find_claude_runtime_meta_file() {
+  local session_id="$1"
+  rg -l --fixed-strings "\"sessionId\": \"$session_id\"" "$HOME/.claude/sessions"/*.json 2>/dev/null | head -n 1
+}
+
+claude_session_cwd() {
+  local session_id="$1"
+  local meta_file
+  meta_file="$(find_claude_runtime_meta_file "$session_id")"
+  [[ -n "$meta_file" && -f "$meta_file" ]] || return 0
+  jq -r '.cwd // empty' "$meta_file" 2>/dev/null | head -n 1
+}
+
+find_cursor_transcript_file() {
+  local session_id="$1"
+  find "$HOME/.cursor/projects" -type f -path "*/agent-transcripts/${session_id}/${session_id}.jsonl" 2>/dev/null | head -n 1
+}
+
+codex_session_cwd() {
+  local session_id="$1"
+  local session_file
+  session_file="$(find_codex_session_file "$session_id")"
+  [[ -n "$session_file" ]] || return 0
+  jq -r 'select(.type == "session_meta") | .payload.cwd // empty' "$session_file" | head -n 1
+}
+
+codex_first_user_message() {
+  local session_id="$1"
+  local session_file
+  session_file="$(find_codex_session_file "$session_id")"
+  [[ -n "$session_file" ]] || return 0
+  jq -r '
+    select(
+      .type == "response_item"
+      and .payload.type == "message"
+      and .payload.role == "user"
+    )
+    | .payload.content[]?
+    | select(.type == "input_text")
+    | .text
+  ' "$session_file" | head -n 1
+}
+
+codex_recent_messages() {
+  local session_id="$1"
+  local session_file
+  session_file="$(find_codex_session_file "$session_id")"
+  [[ -n "$session_file" ]] || return 0
+  jq -r '
+    select(
+      .type == "response_item"
+      and .payload.type == "message"
+      and (.payload.role == "user" or .payload.role == "assistant")
+    )
+    | .payload as $payload
+    | [
+        $payload.role,
+        (
+          if ($payload.content | type) == "array" then
+            ([ $payload.content[]? | .text? // empty ] | join(" "))
+          else
+            ""
+          end
+        )
+      ]
+    | @tsv
+  ' "$session_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n 12
+}
+
+claude_recent_messages() {
+  local session_id="$1"
+  local session_file history_file
+  session_file="$(find_claude_session_file "$session_id")"
+  if [[ -n "$session_file" && -f "$session_file" ]]; then
+    jq -r '
+      def flatten:
+        if type == "string" then .
+        elif type == "array" then
+          ([ .[]?
+            | if .type == "text" then (.text // "")
+              else empty
+              end ] | join(" "))
+        else ""
+        end;
+      select(
+        (.type == "user" and (.message.role // "") == "user" and ((.isMeta // false) | not))
+        or
+        (.type == "assistant" and (.message.role // "") == "assistant")
+      )
+      | [
+          (if .type == "assistant" then "assistant" else "user" end),
+          (
+            if .type == "assistant" then
+              ([ .message.content[]? | select(.type == "text") | .text ] | join(" "))
+            else
+              (.message.content | flatten)
+            end
+            | gsub("[\r\n]+"; " ")
+          )
+        ]
+      | @tsv
+    ' "$session_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n 12
+    return 0
+  fi
+
+  history_file="$HOME/.claude/history.jsonl"
+  [[ -f "$history_file" ]] || return 0
+  rg -F "\"sessionId\":\"$session_id\"" "$history_file" 2>/dev/null \
+    | tail -n 12 \
+    | jq -Rr 'fromjson? | "user\t" + (.display // "")'
+}
+
+opencode_recent_messages() {
+  local session_id="$1"
+  local db_file="$HOME/.local/share/opencode/opencode.db"
+  [[ -f "$db_file" ]] || return 0
+  local session_esc
+  session_esc="$(sql_escape "$session_id")"
+
+  sqlite3_cmd -json "$db_file" "
+    SELECT data
+    FROM message
+    WHERE session_id = '${session_esc}'
+    ORDER BY time_created DESC
+    LIMIT 12
+  " | jq -r '
+    .[]
+    | (.data | fromjson)
+    | [
+        (.role // "assistant"),
+        (
+          .summary.title
+          // .text
+          // (
+            if (.content | type) == "array" then
+              ([ .content[]? | .text? // empty ] | join(" "))
+            else empty
+            end
+          )
+          // ""
+          | gsub("[\r\n]+"; " ")
+        )
+      ]
+    | @tsv
+  ' | awk -F'\t' 'NF > 1 && length($2) > 0 { print }'
+}
+
+gemini_recent_messages() {
+  local source_file="$1"
+  [[ -f "$source_file" ]] || return 0
+  jq -r '
+    .messages[]
+    | select(.type == "user" or .type == "gemini")
+    | [
+        (if .type == "gemini" then "assistant" else .type end),
+        (
+          if (.content | type) == "array" then
+            ([ .content[]?.text? ] | join(" "))
+          else
+            (.content // "")
+          end
+          | gsub("[\r\n]+"; " ")
+        )
+      ]
+    | @tsv
+  ' "$source_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n 12
+}
+
+cursor_recent_messages() {
+  local session_id="$1"
+  local transcript_file
+  transcript_file="$(find_cursor_transcript_file "$session_id")"
+  [[ -n "$transcript_file" && -f "$transcript_file" ]] || return 0
+
+  jq -r '
+    def flatten:
+      if type == "string" then .
+      elif type == "array" then
+        ([ .[]?
+          | if .type == "text" then (.text // "")
+            else empty
+            end ] | join(" "))
+      else ""
+      end;
+    select(.role == "user" or .role == "assistant")
+    | [
+        .role,
+        (.message.content | flatten | gsub("[\r\n]+"; " "))
+      ]
+    | @tsv
+  ' "$transcript_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n 12
+}
+
+list_codex() {
+  python3 - <<'PY' "$HOME" "$ASM_MAX_SESSIONS" "$ASM_CODEX_FILE_CACHE"
+from pathlib import Path
+import json
+import os
+import re
+import sys
+import time
+
+home = Path(sys.argv[1])
+limit = int(sys.argv[2])
+cache_path = Path(sys.argv[3])
+index_file = home / ".codex" / "session_index.jsonl"
+sessions_root = home / ".codex" / "sessions"
+
+if not index_file.exists():
+    raise SystemExit(0)
+
+def build_index():
+    mapping = {}
+    if sessions_root.exists():
+        for path in sessions_root.rglob("*.jsonl"):
+            m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", path.name)
+            if m:
+                mapping[m.group(1)] = str(path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps({"created_at": int(time.time()), "index": mapping}), encoding="utf-8")
+    return mapping
+
+try:
+    if cache_path.exists():
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if int(time.time()) - int(payload.get("created_at", 0)) < 300:
+            file_index = payload.get("index", {})
+        else:
+            file_index = build_index()
+    else:
+        file_index = build_index()
+except Exception:
+    file_index = build_index()
+
+count = 0
+with index_file.open(encoding="utf-8") as fh:
+    for line in fh:
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        session_id = row.get("id")
+        updated_at = row.get("updated_at")
+        if not session_id or not updated_at:
+            continue
+        if session_id not in file_index:
+            continue
+        updated_epoch = int(
+            __import__("datetime").datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
+        )
+        print(json.dumps({
+            "agent": "codex",
+            "id": session_id,
+            "title": row.get("thread_name", ""),
+            "cwd": "",
+            "updated_epoch": updated_epoch,
+            "updated_display": updated_at,
+        }, ensure_ascii=False))
+        count += 1
+        if count >= limit:
+            break
+PY
+}
+
+list_claude() {
+  run_runtime_py list-claude "$HOME" "$ASM_MAX_SESSIONS" "$ASM_CLAUDE_PROJECT_CACHE"
+}
+
+list_opencode() {
+  local db_file="$HOME/.local/share/opencode/opencode.db"
+  [[ -f "$db_file" ]] || return 0
+
+  sqlite3_cmd -json "$db_file" "
+    SELECT
+      id,
+      COALESCE(title, '') AS title,
+      COALESCE(directory, '') AS cwd,
+      COALESCE(time_updated, 0) AS time_updated
+    FROM session
+    ORDER BY time_updated DESC
+    LIMIT ${ASM_MAX_SESSIONS}
+  " | jq -c '
+    .[]
+    | {
+        agent: "opencode",
+        id: .id,
+        title: .title,
+        cwd: .cwd,
+        updated_epoch: ((.time_updated / 1000) | floor),
+        updated_display: (((.time_updated / 1000) | floor) | todateiso8601)
+      }
+  '
+}
+
+list_cursor_agent() {
+  local db_file workspace_file cwd composer_json
+  for db_file in "${(@On)${HOME}/Library/Application Support/Cursor/User/workspaceStorage/*/state.vscdb}"; do
+    workspace_file="${db_file:h}/workspace.json"
+    [[ -f "$workspace_file" ]] || continue
+    composer_json="$(sqlite3_cmd "$db_file" "SELECT value FROM ItemTable WHERE key='composer.composerData';" 2>/dev/null || true)"
+    [[ -n "$composer_json" ]] || continue
+    cwd="$(jq -r '(.folder // "") | sub("^file://"; "")' "$workspace_file" 2>/dev/null || true)"
+
+    print -r -- "$composer_json" | jq -c --arg cwd "$cwd" --arg source "$db_file" '
+      .allComposers[]?
+      | select(.composerId)
+      | {
+          agent: "cursor-agent",
+          id: .composerId,
+          title: (.name // ""),
+          cwd: $cwd,
+          updated_epoch: (((.lastUpdatedAt // .createdAt // 0) / 1000) | floor),
+          updated_display: ((((.lastUpdatedAt // .createdAt // 0) / 1000) | floor) | todateiso8601),
+          source_file: $source
+        }
+    '
+  done | head -n "$ASM_MAX_SESSIONS"
+}
+
+list_gemini() {
+  local file alias_name cwd map_file
+  map_file="$HOME/.gemini/projects.json"
+
+  for file in "${(@On)${HOME}/.gemini/tmp/*/chats/session-*.json}"; do
+    alias_name="${file#$HOME/.gemini/tmp/}"
+    alias_name="${alias_name%%/*}"
+    cwd=""
+    if [[ -f "$map_file" ]]; then
+      cwd="$(jq -r --arg alias "$alias_name" '
+        .projects
+        | to_entries[]
+        | select(.value == $alias)
+        | .key
+      ' "$map_file" | head -n 1)"
+    fi
+
+    jq -c --arg cwd "$cwd" --arg source "$file" '
+      select(.sessionId and .messages and .startTime and .lastUpdated)
+      | select((.kind // "main") != "subagent")
+      | {
+          agent: "gemini",
+          id: .sessionId,
+          title: (
+            .summary
+            // (
+              [
+                .messages[]
+                | select(.type == "user")
+                | (
+                    if (.content | type) == "array" then
+                      ([ .content[]?.text? ] | join(" "))
+                    else
+                      (.content // "")
+                    end
+                  )
+              ][0]
+              // "Empty conversation"
+            )
+          ),
+          cwd: $cwd,
+          updated_epoch: (.lastUpdated | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601),
+          updated_display: .lastUpdated,
+          source_file: $source,
+          message_count: (.messages | length)
+        }
+    ' "$file"
+  done | head -n "$ASM_MAX_SESSIONS"
+}
+
+build_cache() {
+  ensure_storage
+
+  if [[ -z "${ASM_FORCE_REFRESH:-}" ]] && cache_is_fresh "$ASM_SESSION_CACHE_FILE"; then
+    cat "$ASM_SESSION_CACHE_FILE"
+    return 0
+  fi
+
+  local sessions_tmp meta_tmp tabs_tmp tags_tmp
+  sessions_tmp="$(mktemp)"
+  meta_tmp="$(mktemp)"
+  tabs_tmp="$(mktemp)"
+  tags_tmp="$(mktemp)"
+
+  collect_session_records >"$sessions_tmp"
+  export_session_meta_json >"$meta_tmp"
+  export_tab_assignments_json >"$tabs_tmp"
+  export_session_tags_json >"$tags_tmp"
+
+  local output_tmp
+  output_tmp="$(mktemp)"
+
+  merge_cache_payload "$sessions_tmp" "$meta_tmp" "$tabs_tmp" "$tags_tmp" >"$output_tmp"
+
+  cp "$output_tmp" "$ASM_SESSION_CACHE_FILE" 2>/dev/null || true
+  cat "$output_tmp"
+
+  rm -f "$sessions_tmp" "$meta_tmp" "$tabs_tmp" "$tags_tmp" "$output_tmp"
+}
+
+collect_session_records() {
+  {
+    list_codex 2>/dev/null || true
+    list_claude 2>/dev/null || true
+    list_opencode 2>/dev/null || true
+    list_cursor_agent 2>/dev/null || true
+    list_gemini 2>/dev/null || true
+  }
+}
+
+export_session_meta_json() {
+  sqlite3_cmd -json "$ASM_DB" "
+    SELECT
+      agent,
+      session_id,
+      pinned,
+      COALESCE(alias, '') AS alias,
+      COALESCE(last_opened_at, '') AS last_opened_at
+    FROM session_meta
+  "
+}
+
+export_tab_assignments_json() {
+  sqlite3_cmd -json "$ASM_DB" "
+    SELECT
+      ts.agent,
+      ts.session_id,
+      t.name AS tab_name
+    FROM tab_sessions ts
+    JOIN tabs t ON t.id = ts.tab_id
+  "
+}
+
+export_session_tags_json() {
+  sqlite3_cmd -json "$ASM_DB" "
+    SELECT
+      agent,
+      session_id,
+      tag
+    FROM session_tags
+    ORDER BY agent ASC, session_id ASC, tag ASC
+  "
+}
+
+merge_cache_payload() {
+  local sessions_json="$1"
+  local meta_json="$2"
+  local tabs_json="$3"
+  local tags_json="$4"
+  jq -n \
+    --slurpfile sessions "$sessions_json" \
+    --slurpfile meta "$meta_json" \
+    --slurpfile tabs "$tabs_json" \
+    --slurpfile tags "$tags_json" '
+      ($meta[0] // [] | map({key: (.agent + ":" + .session_id), value: .}) | from_entries) as $mx
+      | ($tabs[0] // [] | map({key: (.agent + ":" + .session_id), value: .}) | from_entries) as $tx
+      | (
+          $tags[0] // []
+          | group_by(.agent + ":" + .session_id)
+          | map({
+              key: (.[0].agent + ":" + .[0].session_id),
+              value: {
+                tags: map(.tag),
+                tags_text: (map("#" + .tag) | join(" "))
+              }
+            })
+          | from_entries
+        ) as $gx
+      | (
+          $sessions
+          | map(
+              . + {ref: (.agent + ":" + .id)}
+              + (
+                  ($mx[.agent + ":" + .id] // {})
+                  | {
+                      pinned: (.pinned // 0),
+                      alias: (.alias // ""),
+                      last_opened_at: (.last_opened_at // "")
+                    }
+                )
+              + {
+                  tab_name: (($tx[.agent + ":" + .id] // {}).tab_name // "")
+                }
+              + ($gx[.agent + ":" + .id] // {tags: [], tags_text: ""})
+            )
+          | sort_by(.ref)
+          | group_by(.ref)
+          | map(sort_by(-(.updated_epoch // 0))[0])
+          | sort_by(-(.pinned // 0), -(.updated_epoch // 0), .agent, .id)
+          | .[:$limit]
+        )
+    ' --argjson limit "$ASM_MAX_SESSIONS"
+}
+
+sort_cache_file() {
+  local cache_file="$1"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  jq '
+    sort_by(.ref)
+    | group_by(.ref)
+    | map(sort_by(-(.updated_epoch // 0))[0])
+    | sort_by(-(.pinned // 0), -(.updated_epoch // 0), .agent, .id)
+  ' "$cache_file" >"$tmp_file"
+  mv "$tmp_file" "$cache_file"
+}
+
+toggle_pin_in_cache() {
+  local cache_file="$1"
+  shift
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  local ref
+  for ref in "$@"; do
+    [[ -n "$ref" ]] || continue
+    is_tab_ref "$ref" && continue
+    toggle_pin "$ref"
+  done
+
+  jq --argjson refs "$(printf '%s\n' "$@" | jq -R . | jq -s .)" '
+    map(
+      if (.ref as $r | $refs | index($r)) != null then
+        .pinned = (if (.pinned // 0) == 1 then 0 else 1 end)
+      else
+        .
+      end
+    )
+  ' "$cache_file" >"$tmp_file"
+  mv "$tmp_file" "$cache_file"
+  sort_cache_file "$cache_file"
+  cp "$cache_file" "$ASM_SESSION_CACHE_FILE" 2>/dev/null || true
+}
+
+set_pin_in_cache() {
+  local cache_file="$1"
+  local desired="${2:-1}"
+  shift 2
+  local tmp_file desired_pin
+  tmp_file="$(mktemp)"
+  if [[ "$desired" == "0" ]]; then
+    desired_pin=0
+  else
+    desired_pin=1
+  fi
+
+  local ref
+  for ref in "$@"; do
+    [[ -n "$ref" ]] || continue
+    is_tab_ref "$ref" && continue
+    set_pin_for_ref "$ref" "$desired_pin"
+  done
+
+  jq --argjson refs "$(printf '%s\n' "$@" | jq -R . | jq -s .)" --argjson desired "$desired_pin" '
+    map(
+      if (.ref as $r | $refs | index($r)) != null then
+        .pinned = $desired
+      else
+        .
+      end
+    )
+  ' "$cache_file" >"$tmp_file"
+  mv "$tmp_file" "$cache_file"
+  sort_cache_file "$cache_file"
+  cp "$cache_file" "$ASM_SESSION_CACHE_FILE" 2>/dev/null || true
+}
+
+refresh_cache_file() {
+  local cache_file="$1"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  ASM_FORCE_REFRESH=1 build_cache >"$tmp_file"
+  mv "$tmp_file" "$cache_file"
+  cp "$cache_file" "$ASM_SESSION_CACHE_FILE" 2>/dev/null || true
+}
+
+toggle_tag_in_cache() {
+  local cache_file="$1"
+  local ref="$2"
+  local tag="$3"
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  toggle_ref_tag "$ref" "$tag"
+  refresh_cache_file "$cache_file"
+}
+
+assign_ref_to_cache_tab() {
+  local cache_file="$1"
+  local tab_name="$2"
+  shift 2
+  local tmp_file
+  tmp_file="$(mktemp)"
+  local ref
+  for ref in "$@"; do
+    [[ -n "$ref" ]] || continue
+    assign_ref_to_tab "$ref" "$tab_name"
+  done
+  jq --argjson refs "$(printf '%s\n' "$@" | jq -R . | jq -s .)" --arg tab_name "$tab_name" '
+    map(if (.ref as $r | $refs | index($r)) != null then .tab_name = $tab_name else . end)
+  ' "$cache_file" >"$tmp_file"
+  mv "$tmp_file" "$cache_file"
+  cp "$cache_file" "$ASM_SESSION_CACHE_FILE" 2>/dev/null || true
+}
+
+remove_ref_from_cache_tab() {
+  local cache_file="$1"
+  shift
+  local tmp_file
+  tmp_file="$(mktemp)"
+  local ref
+  for ref in "$@"; do
+    [[ -n "$ref" ]] || continue
+    remove_ref_from_tab "$ref"
+  done
+  jq --argjson refs "$(printf '%s\n' "$@" | jq -R . | jq -s .)" '
+    map(if (.ref as $r | $refs | index($r)) != null then .tab_name = "" else . end)
+  ' "$cache_file" >"$tmp_file"
+  mv "$tmp_file" "$cache_file"
+  cp "$cache_file" "$ASM_SESSION_CACHE_FILE" 2>/dev/null || true
+}
+
+move_refs_to_tab_interactive() {
+  local cache_file="$1"
+  shift
+  local refs=("$@")
+  [[ ${#refs[@]} -gt 0 ]] || return 0
+
+  local action target_tab
+  action="$(choose_tab_action)" || return 0
+  action="${action%%$'\t'*}"
+  [[ -n "$action" ]] || return 0
+
+  case "$action" in
+    move)
+      target_tab="$(choose_tab_name 'move-to-tab> ')" || return 0
+      [[ -n "$target_tab" ]] || return 0
+      if [[ "$target_tab" == "+new" ]]; then
+        target_tab="$(prompt_tab_name)"
+        [[ -n "$target_tab" ]] || return 0
+      fi
+      if [[ "$target_tab" == "All" ]]; then
+        remove_ref_from_cache_tab "$cache_file" "${refs[@]}"
+      else
+        assign_ref_to_cache_tab "$cache_file" "$target_tab" "${refs[@]}"
+      fi
+      ;;
+    new)
+      target_tab="$(prompt_tab_name)"
+      [[ -n "$target_tab" ]] || return 0
+      assign_ref_to_cache_tab "$cache_file" "$target_tab" "${refs[@]}"
+      ;;
+    clear)
+      remove_ref_from_cache_tab "$cache_file" "${refs[@]}"
+      ;;
+  esac
+}
+
+render_lines() {
+  local cache_file="$1"
+  local active_tab="${2:-All}"
+  run_runtime_py render-lines "$cache_file" "$active_tab" "$ASM_NOW_EPOCH"
+}
+
+render_picker_rows() {
+  local cache_file="$1"
+  local state_file="$2"
+  local mode active_tab
+  mode="$(picker_state_mode "$state_file")"
+  if [[ "$mode" == "tab-target" ]]; then
+    picker_tab_target_rows
+  else
+    active_tab="$(get_active_tab_name)"
+    render_lines "$cache_file" "$active_tab"
+  fi
+}
+
+record_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  jq -c --arg ref "$ref" '.[] | select(.ref == $ref)' "$cache_file" | head -n 1
+}
+
+field_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local field="$3"
+  jq -r --arg ref "$ref" --arg field "$field" '
+    .[]
+    | select(.ref == $ref)
+    | .[$field] // ""
+  ' "$cache_file" | head -n 1
+}
+
+resolve_cwd() {
+  local agent="$1"
+  local session_id="$2"
+  local cached_cwd="${3:-}"
+  if [[ -n "$cached_cwd" ]]; then
+    print -r -- "$cached_cwd"
+    return 0
+  fi
+
+  case "$agent" in
+    codex)
+      codex_session_cwd "$session_id"
+      ;;
+    claude)
+      claude_session_cwd "$session_id"
+      ;;
+    *)
+      print -r -- "$HOME"
+      ;;
+  esac
+}
+
+update_last_opened() {
+  local ref="$1"
+  local parts
+  parts=("${(@s: :)$(split_ref "$ref")}")
+  local agent_esc id_esc
+  agent_esc="$(sql_escape "${parts[1]}")"
+  id_esc="$(sql_escape "${parts[2]}")"
+  sqlite3_cmd "$ASM_DB" "
+    INSERT INTO session_meta (agent, session_id, last_opened_at)
+    VALUES ('${agent_esc}', '${id_esc}', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    ON CONFLICT(agent, session_id) DO UPDATE SET
+      last_opened_at = excluded.last_opened_at
+  " >/dev/null
+}
+
+toggle_pin() {
+  local ref="$1"
+  local parts
+  parts=("${(@s: :)$(split_ref "$ref")}")
+  local agent_esc id_esc
+  agent_esc="$(sql_escape "${parts[1]}")"
+  id_esc="$(sql_escape "${parts[2]}")"
+
+  sqlite3_cmd "$ASM_DB" "
+    INSERT INTO session_meta (agent, session_id, pinned)
+    VALUES ('${agent_esc}', '${id_esc}', 1)
+    ON CONFLICT(agent, session_id) DO UPDATE SET
+      pinned = CASE session_meta.pinned WHEN 1 THEN 0 ELSE 1 END
+  " >/dev/null
+}
+
+set_pin_for_ref() {
+  local ref="$1"
+  local desired="${2:-1}"
+  local parts
+  parts=("${(@s: :)$(split_ref "$ref")}")
+  local agent_esc id_esc desired_pin
+  agent_esc="$(sql_escape "${parts[1]}")"
+  id_esc="$(sql_escape "${parts[2]}")"
+  if [[ "$desired" == "0" ]]; then
+    desired_pin=0
+  else
+    desired_pin=1
+  fi
+
+  sqlite3_cmd "$ASM_DB" "
+    INSERT INTO session_meta (agent, session_id, pinned)
+    VALUES ('${agent_esc}', '${id_esc}', ${desired_pin})
+    ON CONFLICT(agent, session_id) DO UPDATE SET
+      pinned = excluded.pinned
+  " >/dev/null
+}
+
+set_alias_for_ref() {
+  local ref="$1"
+  local alias_text="$2"
+  local parts
+  parts=("${(@s: :)$(split_ref "$ref")}")
+  local agent_esc id_esc alias_esc
+  agent_esc="$(sql_escape "${parts[1]}")"
+  id_esc="$(sql_escape "${parts[2]}")"
+  alias_esc="$(sql_escape "$alias_text")"
+
+  sqlite3_cmd "$ASM_DB" "
+    INSERT INTO session_meta (agent, session_id, alias)
+    VALUES ('${agent_esc}', '${id_esc}', '${alias_esc}')
+    ON CONFLICT(agent, session_id) DO UPDATE SET
+      alias = excluded.alias
+  " >/dev/null
+}
+
+resume_command_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local agent session_id cached_cwd cwd
+
+  agent="${ref%%:*}"
+  session_id="${ref#*:}"
+  cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  [[ -n "$cwd" ]] || cwd="$HOME"
+
+  case "$agent" in
+    codex)
+      print -r -- "cd $(shell_quote "$cwd") && codex resume $(shell_quote "$session_id")"
+      ;;
+    claude)
+      print -r -- "cd $(shell_quote "$cwd") && claude --dangerously-skip-permissions --resume $(shell_quote "$session_id")"
+      ;;
+    opencode)
+      print -r -- "cd $(shell_quote "$cwd") && opencode -s $(shell_quote "$session_id")"
+      ;;
+    cursor-agent)
+      print -r -- "cd $(shell_quote "$cwd") && cursor-agent --resume $(shell_quote "$session_id")"
+      ;;
+    gemini)
+      print -r -- "cd $(shell_quote "$cwd") && gemini --resume $(shell_quote "$session_id")"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+clone_command_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local agent session_id cached_cwd cwd
+
+  agent="${ref%%:*}"
+  session_id="${ref#*:}"
+  cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  [[ -n "$cwd" ]] || cwd="$HOME"
+
+  case "$agent" in
+    codex)
+      print -r -- "cd $(shell_quote "$cwd") && codex fork $(shell_quote "$session_id")"
+      ;;
+    claude)
+      print -r -- "cd $(shell_quote "$cwd") && claude --dangerously-skip-permissions --resume $(shell_quote "$session_id") --fork-session"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+build_handoff_markdown() {
+  local cache_file="$1"
+  local ref="$2"
+  local target_agent="$3"
+  local agent session_id title alias_text cached_cwd cwd updated_display hint tags_text resume_cmd recent_excerpt last_opened_at
+
+  agent="${ref%%:*}"
+  session_id="${ref#*:}"
+  title="$(field_for_ref "$cache_file" "$ref" "title")"
+  alias_text="$(field_for_ref "$cache_file" "$ref" "alias")"
+  cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  updated_display="$(field_for_ref "$cache_file" "$ref" "updated_display")"
+  last_opened_at="$(field_for_ref "$cache_file" "$ref" "last_opened_at")"
+  tags_text="$(field_for_ref "$cache_file" "$ref" "tags_text")"
+  resume_cmd="$(resume_command_for_ref "$cache_file" "$ref" 2>/dev/null || true)"
+  recent_excerpt="$(recent_preview_text_for_ref "$cache_file" "$ref")"
+  hint=""
+
+  if [[ "$agent" == "codex" ]]; then
+    hint="$(codex_first_user_message "$session_id")"
+  fi
+
+  cat <<EOF
+# Session Handoff
+
+- Source agent: $agent
+- Source session: $session_id
+- Target agent: $target_agent
+- Original cwd: ${cwd:-$HOME}
+- Known title: ${alias_text:-$title}
+- Last seen: $updated_display
+- Last opened in asm: ${last_opened_at:-"-"}
+- Tags: ${tags_text:-"-"}
+- Reopen source: ${resume_cmd:-"-"}
+
+## Goal
+Continue the work from this session in the target agent.
+
+## Notes
+- This bundle was generated automatically from local session metadata.
+- Validate important details against the source session if the task is high risk.
+
+## Seed Context
+${hint:-No seed message was extracted automatically. Open the source session if you need the full thread.}
+
+## Recent Transcript Excerpt
+${recent_excerpt:-No recent excerpt was extracted.}
+EOF
+}
+
+export_bundle_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local target_agent="${3:-portable}"
+  ensure_storage
+
+  local ts out_file
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  out_file="$ASM_EXPORT_DIR/${ref//:/_}-to-${target_agent}-${ts}.md"
+  build_handoff_markdown "$cache_file" "$ref" "$target_agent" >"$out_file"
+  print -r -- "$out_file"
+}
+
+choose_handoff_target() {
+  printf '%s\n' codex claude gemini | fzf --height=8 --layout=reverse --prompt='handoff> '
+}
+
+normalize_snapshot_name() {
+  local name="${1:-latest}"
+  name="$(clean_text "$name")"
+  name="$(printf '%s' "$name" | tr -cs 'A-Za-z0-9._-' '-')"
+  name="${name#-}"
+  name="${name%-}"
+  [[ -n "$name" ]] || name="latest"
+  print -r -- "$name"
+}
+
+iterm_snapshot_path() {
+  local snapshot_name
+  snapshot_name="$(normalize_snapshot_name "${1:-latest}")"
+  print -r -- "$ASM_ITERM_LAYOUT_DIR/${snapshot_name}.json"
+}
+
+build_current_iterm_snapshot() {
+  local raw_file
+  raw_file="$(mktemp)"
+
+  if ! ensure_iterm_automation_ready; then
+    rm -f "$raw_file"
+    return 1
+  fi
+  if ! iterm_running; then
+    rm -f "$raw_file"
+    print -u2 -- "iTerm2 is not running"
+    return 1
+  fi
+  if [[ "$(iterm_window_count 2>/dev/null || print 0)" == "0" ]]; then
+    rm -f "$raw_file"
+    print -u2 -- "no iTerm2 windows are open"
+    return 1
+  fi
+
+  run_osascript_script "$ASM_ITERM_SCAN_TIMEOUT" <<'APPLESCRIPT' >"$raw_file"
+tell application "iTerm2"
+  if (count of windows) = 0 then return ""
+
+  set rowList to {}
+  set currentWindowId to id of current window
+  set windowOrder to 0
+
+  repeat with w in windows
+    set windowOrder to windowOrder + 1
+    set b to bounds of w
+    set selectedTabOrder to 1
+    set tabOrder to 0
+
+    repeat with t in tabs of w
+      set tabOrder to tabOrder + 1
+      if t is current tab of w then
+        set selectedTabOrder to tabOrder
+      end if
+    end repeat
+
+    set isCurrentWindow to "0"
+    if (id of w as string) is equal to (currentWindowId as string) then
+      set isCurrentWindow to "1"
+    end if
+
+    set end of rowList to "W<<<ASMSEP>>>" & (windowOrder as string) & "<<<ASMSEP>>>" & (id of w as string) & "<<<ASMSEP>>>" & (item 1 of b as string) & "," & (item 2 of b as string) & "," & (item 3 of b as string) & "," & (item 4 of b as string) & "<<<ASMSEP>>>" & (selectedTabOrder as string) & "<<<ASMSEP>>>" & isCurrentWindow
+
+    set tabOrder to 0
+    repeat with t in tabs of w
+      set tabOrder to tabOrder + 1
+      set tabTitleValue to ""
+      try
+        set tabTitleValue to name of current session of t
+      end try
+      set end of rowList to "T<<<ASMSEP>>>" & (windowOrder as string) & "<<<ASMSEP>>>" & (tabOrder as string) & "<<<ASMSEP>>>" & tabTitleValue
+      set sessionOrder to 0
+      repeat with s in sessions of t
+        set sessionOrder to sessionOrder + 1
+        set ttyValue to ""
+        set profileValue to ""
+        set nameValue to ""
+        set columnsValue to ""
+        set rowsValue to ""
+        try
+          set ttyValue to tty of s
+        end try
+        try
+          set profileValue to profile name of s
+        end try
+        try
+          set nameValue to name of s
+        end try
+        try
+          set columnsValue to columns of s as string
+        end try
+        try
+          set rowsValue to rows of s as string
+        end try
+
+        set end of rowList to "S<<<ASMSEP>>>" & (windowOrder as string) & "<<<ASMSEP>>>" & (tabOrder as string) & "<<<ASMSEP>>>" & (sessionOrder as string) & "<<<ASMSEP>>>" & ttyValue & "<<<ASMSEP>>>" & profileValue & "<<<ASMSEP>>>" & nameValue & "<<<ASMSEP>>>" & columnsValue & "<<<ASMSEP>>>" & rowsValue
+      end repeat
+    end repeat
+  end repeat
+
+  set oldTids to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to linefeed
+  set joinedText to rowList as text
+  set AppleScript's text item delimiters to oldTids
+  return joinedText
+end tell
+APPLESCRIPT
+  local apple_rc=$?
+  if [[ "$apple_rc" != "0" ]]; then
+    rm -f "$raw_file"
+    print -u2 -- "failed to query iTerm2 windows"
+    return 1
+  fi
+
+  if [[ ! -s "$raw_file" ]]; then
+    rm -f "$raw_file"
+    print -u2 -- "no iTerm2 windows are open"
+    return 1
+  fi
+
+  python3 - "$raw_file" <<'PY'
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+
+SEP = "<<<ASMSEP>>>"
+UUID_PATTERN = r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})"
+SCAN_TIMEOUT = float(os.environ.get("ASM_ITERM_SCAN_TIMEOUT", "0.35"))
+AGENT_FILE_PATTERNS = [
+    ("codex", re.compile(r"/\.codex/sessions/.+?-" + UUID_PATTERN + r"\.jsonl$")),
+    ("claude", re.compile(r"/\.claude/projects/.+/" + UUID_PATTERN + r"\.jsonl$")),
+    ("gemini", re.compile(r"/\.gemini/tmp/.+/chats/session-" + UUID_PATTERN + r"\.json$")),
+    ("cursor-agent", re.compile(r"/agent-transcripts/" + UUID_PATTERN + r"/")),
+]
+AGENT_NAMES = {"codex", "claude", "opencode", "cursor-agent", "gemini"}
+
+
+def run(cmd):
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return ""
+    return proc.stdout
+
+
+def is_transient_interactive(command):
+    command = (command or "").strip().lower()
+    if not command:
+        return False
+
+    transient_markers = [
+        "/.local/bin/asm",
+        " asm",
+        " fzf",
+        "/fzf",
+    ]
+    return any(marker in command for marker in transient_markers)
+
+
+def cwd_for_pid(pid):
+    if not pid:
+        return ""
+    out = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
+def parse_ps_tty(tty):
+    if not tty:
+        return []
+    tty_name = tty.replace("/dev/", "")
+    out = run(["ps", "-t", tty_name, "-o", "pid=,ppid=,pgid=,stat=,command="])
+    procs = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            pgid = int(parts[2])
+        except ValueError:
+            continue
+        procs.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "pgid": pgid,
+                "stat": parts[3],
+                "command": parts[4],
+            }
+        )
+    procs.sort(key=lambda proc: proc["pid"])
+    return procs
+
+
+def descendants_for_pid(root_pid, procs):
+    children = defaultdict(list)
+    for proc in procs:
+        children[proc["ppid"]].append(proc["pid"])
+
+    ordered = []
+    queue = deque([root_pid])
+    seen = set()
+    while queue:
+        pid = queue.popleft()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        ordered.append(pid)
+        for child_pid in children.get(pid, []):
+            queue.append(child_pid)
+    return ordered
+
+
+def find_session_file(pids):
+    for pid in pids:
+        out = run(["lsof", "-p", str(pid)])
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            path = parts[-1]
+            for agent, pattern in AGENT_FILE_PATTERNS:
+                match = pattern.search(path)
+                if match:
+                    return {
+                        "agent": agent,
+                        "session_id": match.group(1),
+                        "path": path,
+                        "owner_pid": pid,
+                    }
+    return None
+
+
+def codex_cwd_from_session_file(path):
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                try:
+                    row = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") != "session_meta":
+                    continue
+                payload = row.get("payload") or {}
+                cwd = payload.get("cwd") or ""
+                if cwd:
+                    return cwd
+    except OSError:
+        return ""
+    return ""
+
+
+def claude_runtime_meta_for_pid(pid):
+    if not pid:
+        return None
+    path = os.path.expanduser(f"~/.claude/sessions/{pid}.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return {
+        "session_id": payload.get("sessionId") or "",
+        "cwd": payload.get("cwd") or "",
+        "path": path,
+    }
+
+
+def parse_agent_from_command(command):
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    for index, token in enumerate(tokens):
+        base = os.path.basename(token)
+        if base in AGENT_NAMES:
+            return base, index, tokens
+        if base == "node" and index + 1 < len(tokens):
+            next_base = os.path.basename(tokens[index + 1])
+            if next_base in AGENT_NAMES:
+                return next_base, index + 1, tokens
+    return "", -1, tokens
+
+
+def session_id_from_tokens(agent, agent_index, tokens):
+    if agent_index < 0:
+        return ""
+
+    if agent == "codex":
+        for index in range(agent_index + 1, len(tokens) - 1):
+            if tokens[index] == "resume":
+                return tokens[index + 1]
+    elif agent in {"claude", "cursor-agent", "gemini"}:
+        for index in range(agent_index + 1, len(tokens) - 1):
+            if tokens[index] == "--resume":
+                return tokens[index + 1]
+    elif agent == "opencode":
+        for index in range(agent_index + 1, len(tokens) - 1):
+            if tokens[index] == "-s":
+                return tokens[index + 1]
+
+    return ""
+
+
+def build_restore(agent, command, cwd, session_id):
+    cwd = cwd or os.path.expanduser("~")
+    quoted_cwd = shlex.quote(cwd)
+    quoted_session_id = shlex.quote(session_id) if session_id else ""
+
+    if is_transient_interactive(command):
+        return "shell", f"cd {quoted_cwd}"
+
+    if agent == "codex" and session_id:
+        return "agent_resume", f"cd {quoted_cwd} && codex resume {quoted_session_id}"
+    if agent == "claude":
+        if session_id:
+            return "agent_resume", f"cd {quoted_cwd} && claude --dangerously-skip-permissions --resume {quoted_session_id}"
+        return "agent", f"cd {quoted_cwd} && claude --dangerously-skip-permissions"
+    if agent == "opencode":
+        if session_id:
+            return "agent_resume", f"cd {quoted_cwd} && opencode -s {quoted_session_id}"
+        return "agent", f"cd {quoted_cwd} && opencode"
+    if agent == "cursor-agent":
+        if session_id:
+            return "agent_resume", f"cd {quoted_cwd} && cursor-agent --resume {quoted_session_id}"
+        return "agent", f"cd {quoted_cwd} && cursor-agent"
+    if agent == "gemini":
+        if session_id:
+            return "agent_resume", f"cd {quoted_cwd} && gemini --resume {quoted_session_id}"
+        return "agent", f"cd {quoted_cwd} && gemini"
+
+    shell_match = re.match(r"^-(zsh|bash|fish)$", command or "")
+    if shell_match or not command:
+        return "shell", f"cd {quoted_cwd}"
+
+    return "command", f"cd {quoted_cwd} && {command}"
+
+
+def analyze_tty(tty):
+    procs = parse_ps_tty(tty)
+    home = os.path.expanduser("~")
+    if not procs:
+        restore_kind, restore_command = build_restore("", "", home, "")
+        return {
+            "tty_process_count": 0,
+            "shell_pid": 0,
+            "process_pid": 0,
+            "process_command": "",
+            "cwd": home,
+            "agent": "",
+            "session_id": "",
+            "restore_kind": restore_kind,
+            "restore_command": restore_command,
+            "session_file": "",
+        }
+
+    shell_proc = next(
+        (proc for proc in procs if re.match(r"^-(zsh|bash|fish)$", proc["command"])),
+        None,
+    )
+    shell_pid = shell_proc["pid"] if shell_proc else 0
+    fg_procs = [proc for proc in procs if "+" in proc["stat"]]
+
+    candidate = None
+    if shell_pid:
+        candidate = next(
+            (
+                proc
+                for proc in fg_procs
+                if proc["ppid"] == shell_pid and proc["pid"] != shell_pid
+            ),
+            None,
+        )
+    if candidate is None:
+        candidate = next(
+            (
+                proc
+                for proc in fg_procs
+                if proc["pid"] != shell_pid and not proc["command"].startswith("login ")
+            ),
+            None,
+        )
+    if candidate is None:
+        candidate = shell_proc or procs[-1]
+
+    lineage_pids = descendants_for_pid(candidate["pid"], procs)
+    agent, agent_index, tokens = parse_agent_from_command(candidate["command"])
+    session_id = session_id_from_tokens(agent, agent_index, tokens)
+
+    session_file = find_session_file(lineage_pids)
+    if session_file:
+        if not agent:
+            agent = session_file["agent"]
+        if not session_id:
+            session_id = session_file["session_id"]
+
+    claude_meta = None
+    if agent == "claude":
+        claude_meta = claude_runtime_meta_for_pid(candidate["pid"]) or claude_runtime_meta_for_pid(shell_pid)
+        if claude_meta:
+            if not session_id:
+                session_id = claude_meta["session_id"]
+
+    cwd = cwd_for_pid(candidate["pid"]) or cwd_for_pid(shell_pid) or home
+    if agent == "codex" and session_file:
+        session_cwd = codex_cwd_from_session_file(session_file["path"])
+        if session_cwd:
+            cwd = session_cwd
+    if agent == "claude" and claude_meta and claude_meta["cwd"]:
+        cwd = claude_meta["cwd"]
+
+    restore_kind, restore_command = build_restore(
+        agent,
+        candidate["command"],
+        cwd,
+        session_id,
+    )
+
+    return {
+        "tty_process_count": len(procs),
+        "shell_pid": shell_pid,
+        "process_pid": candidate["pid"],
+        "process_command": candidate["command"],
+        "cwd": cwd,
+        "agent": agent,
+        "session_id": session_id,
+        "restore_kind": restore_kind,
+        "restore_command": restore_command,
+        "session_file": (session_file or {}).get("path", ""),
+    }
+
+
+def detect_split_direction(sessions):
+    if len(sessions) < 2:
+        return ""
+
+    max_columns = max((session.get("columns") or 0) for session in sessions)
+    max_rows = max((session.get("rows") or 0) for session in sessions)
+    horizontal_score = sum(
+        1 for session in sessions if abs((session.get("columns") or 0) - max_columns) <= 1
+    )
+    vertical_score = sum(
+        1 for session in sessions if abs((session.get("rows") or 0) - max_rows) <= 1
+    )
+    if horizontal_score >= vertical_score:
+        return "horizontal"
+    return "vertical"
+
+
+def fallback_tree(sessions, direction):
+    if not sessions:
+        return None
+
+    nodes = [{"kind": "leaf", "session_order": session["session_order"]} for session in sessions]
+    tree = nodes[0]
+    for node in nodes[1:]:
+        tree = {
+            "kind": "split",
+            "direction": direction or "horizontal",
+            "children": [tree, node],
+        }
+    return tree
+
+
+def build_layout_tree(sessions):
+    if not sessions:
+        return None
+    if len(sessions) == 1:
+        return {"kind": "leaf", "session_order": sessions[0]["session_order"]}
+
+    preferred_direction = detect_split_direction(sessions)
+    leaf_map = {
+        session["session_order"]: {
+            "kind": "leaf",
+            "session_order": session["session_order"],
+            "width": max(session.get("columns") or 0, 1),
+            "height": max(session.get("rows") or 0, 1),
+            "area_sum": max(session.get("columns") or 0, 1)
+            * max(session.get("rows") or 0, 1),
+            "score": 0.0,
+            "gap": 0,
+        }
+        for session in sessions
+    }
+
+    memo = {}
+
+    def canonical_tree(node):
+        if node["kind"] == "leaf":
+            return {"kind": "leaf", "session_order": node["session_order"]}
+        return {
+            "kind": "split",
+            "direction": node["direction"],
+            "children": [canonical_tree(child) for child in node["children"]],
+        }
+
+    def better(candidate, best):
+        if best is None:
+            return True
+        candidate_key = (
+            round(candidate["score"], 4),
+            candidate["gap"],
+            candidate["width"] * candidate["height"],
+        )
+        best_key = (
+            round(best["score"], 4),
+            best["gap"],
+            best["width"] * best["height"],
+        )
+        return candidate_key < best_key
+
+    def solve(orders):
+        orders = tuple(sorted(orders))
+        if orders in memo:
+            return memo[orders]
+        if len(orders) == 1:
+            memo[orders] = leaf_map[orders[0]]
+            return memo[orders]
+
+        first_order = orders[0]
+        tail = orders[1:]
+        best = None
+
+        for mask in range(0, 1 << len(tail)):
+            left_orders = [first_order]
+            right_orders = []
+            for index, order in enumerate(tail):
+                if mask & (1 << index):
+                    left_orders.append(order)
+                else:
+                    right_orders.append(order)
+            if not right_orders:
+                continue
+
+            left = solve(tuple(left_orders))
+            right = solve(tuple(right_orders))
+            if left is None or right is None:
+                continue
+
+            width_diff = abs(left["width"] - right["width"])
+            if width_diff <= 3:
+                width = max(left["width"], right["width"])
+                height = left["height"] + right["height"]
+                gap = width * height - (left["area_sum"] + right["area_sum"])
+                penalty = 0.0 if preferred_direction == "horizontal" else 0.25
+                candidate = {
+                    "kind": "split",
+                    "direction": "horizontal",
+                    "children": [left, right],
+                    "width": width,
+                    "height": height,
+                    "area_sum": left["area_sum"] + right["area_sum"],
+                    "gap": gap,
+                    "score": left["score"] + right["score"] + width_diff + (gap * 0.05) + penalty,
+                }
+                if better(candidate, best):
+                    best = candidate
+
+            height_diff = abs(left["height"] - right["height"])
+            if height_diff <= 3:
+                width = left["width"] + right["width"]
+                height = max(left["height"], right["height"])
+                gap = width * height - (left["area_sum"] + right["area_sum"])
+                penalty = 0.0 if preferred_direction == "vertical" else 0.25
+                candidate = {
+                    "kind": "split",
+                    "direction": "vertical",
+                    "children": [left, right],
+                    "width": width,
+                    "height": height,
+                    "area_sum": left["area_sum"] + right["area_sum"],
+                    "gap": gap,
+                    "score": left["score"] + right["score"] + height_diff + (gap * 0.05) + penalty,
+                }
+                if better(candidate, best):
+                    best = candidate
+
+        memo[orders] = best
+        return best
+
+    solved = solve(tuple(sorted(leaf_map.keys())))
+    if solved is None:
+        return fallback_tree(sessions, preferred_direction)
+    return canonical_tree(solved)
+
+
+windows = {}
+tab_meta = {}
+tab_rows = defaultdict(list)
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split(SEP)
+        if parts[0] == "W" and len(parts) >= 6:
+            bounds = [int(part) for part in parts[3].split(",")]
+            windows[int(parts[1])] = {
+                "window_order": int(parts[1]),
+                "window_id": int(parts[2]),
+                "bounds": bounds,
+                "selected_tab_order": int(parts[4]),
+                "is_current_window": parts[5] == "1",
+                "tabs": [],
+            }
+        elif parts[0] == "T" and len(parts) >= 4:
+            tab_meta[(int(parts[1]), int(parts[2]))] = {
+                "tab_title": parts[3],
+            }
+        elif parts[0] == "S" and len(parts) >= 9:
+            try:
+                columns = int(parts[7]) if parts[7] else 0
+                rows = int(parts[8]) if parts[8] else 0
+            except ValueError:
+                columns = 0
+                rows = 0
+            session_meta = {
+                "window_order": int(parts[1]),
+                "tab_order": int(parts[2]),
+                "session_order": int(parts[3]),
+                "tty": parts[4],
+                "profile": parts[5],
+                "name": parts[6],
+                "columns": columns,
+                "rows": rows,
+            }
+            session_meta.update(analyze_tty(parts[4]))
+            tab_rows[(session_meta["window_order"], session_meta["tab_order"])].append(session_meta)
+
+ordered_windows = []
+for window_order in sorted(windows):
+    window = windows[window_order]
+    tab_orders = sorted(
+        {tab_order for win_order, tab_order in tab_rows.keys() if win_order == window_order}
+    )
+    for tab_order in tab_orders:
+        sessions = sorted(
+            tab_rows[(window_order, tab_order)],
+            key=lambda session: session["session_order"],
+        )
+        window["tabs"].append(
+            {
+                "tab_order": tab_order,
+                "tab_title": (tab_meta.get((window_order, tab_order), {}) or {}).get("tab_title", ""),
+                "session_count": len(sessions),
+                "split_direction": detect_split_direction(sessions),
+                "layout_tree": build_layout_tree(sessions),
+                "sessions": sessions,
+            }
+        )
+    ordered_windows.append(window)
+
+snapshot = {
+    "version": 1,
+    "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "host": socket.gethostname(),
+    "window_count": len(ordered_windows),
+    "session_count": sum(
+        len(tab["sessions"]) for window in ordered_windows for tab in window["tabs"]
+    ),
+    "windows": ordered_windows,
+}
+
+print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+PY
+
+  local rc=$?
+  rm -f "$raw_file"
+  return "$rc"
+}
+
+build_iterm_launch_command() {
+  local restore_kind="${1:-command}"
+  local cmd="$2"
+  local wrapped_inner
+
+  case "$restore_kind" in
+    shell)
+      wrapped_inner="$cmd; exec /bin/zsh -il"
+      ;;
+    *)
+      wrapped_inner="$cmd"
+      ;;
+  esac
+
+  print -r -- "/bin/zsh -ilc $(shell_quote "$wrapped_inner")"
+}
+
+apply_bounds_to_iterm_window() {
+  local window_id="$1"
+  local bounds="${2:-}"
+  [[ -n "$window_id" && -n "$bounds" ]] || return 0
+
+  ASM_ITERM_WINDOW_ID="$window_id" ASM_ITERM_BOUNDS="$bounds" run_osascript_script 2 >/dev/null <<'APPLESCRIPT'
+set targetWindowId to (system attribute "ASM_ITERM_WINDOW_ID") as integer
+set rawBounds to system attribute "ASM_ITERM_BOUNDS"
+if rawBounds is "" then return
+
+set oldTids to AppleScript's text item delimiters
+set AppleScript's text item delimiters to ","
+set bits to every text item of rawBounds
+set AppleScript's text item delimiters to oldTids
+if (count of bits) is not 4 then return
+
+tell application "iTerm2"
+  repeat 20 times
+    if exists window id targetWindowId then exit repeat
+    delay 0.05
+  end repeat
+  set bounds of window id targetWindowId to {(item 1 of bits as integer), (item 2 of bits as integer), (item 3 of bits as integer), (item 4 of bits as integer)}
+end tell
+APPLESCRIPT
+}
+
+open_layout_window_in_iterm() {
+  local cmd="$1"
+  local restore_kind="${2:-command}"
+  local profile="${3:-}"
+  local wrapped_cmd
+  ensure_iterm_automation_ready || return 1
+  wrapped_cmd="$(build_iterm_launch_command "$restore_kind" "$cmd")"
+  debug_log "layout window kind=$restore_kind profile=$profile cmd=$cmd"
+
+  ASM_ITERM_CMD="$wrapped_cmd" ASM_ITERM_PROFILE="$profile" run_osascript_script 2 <<'APPLESCRIPT'
+set shellCommand to system attribute "ASM_ITERM_CMD"
+set profileName to system attribute "ASM_ITERM_PROFILE"
+tell application "iTerm2"
+  activate
+  set existingIds to id of every window
+  if profileName is not "" then
+    create window with profile profileName command shellCommand
+  else
+    create window with default profile command shellCommand
+  end if
+  repeat 40 times
+    set currentIds to id of every window
+    repeat with candidateId in currentIds
+      if existingIds does not contain candidateId then
+        return candidateId as string
+      end if
+    end repeat
+    delay 0.05
+  end repeat
+  if (count of windows) > 0 then
+    return (id of current window) as string
+  end if
+end tell
+APPLESCRIPT
+}
+
+open_layout_tab_in_iterm() {
+  local window_id="$1"
+  local cmd="$2"
+  local restore_kind="${3:-command}"
+  local profile="${4:-}"
+  local wrapped_cmd
+  ensure_iterm_automation_ready || return 1
+  wrapped_cmd="$(build_iterm_launch_command "$restore_kind" "$cmd")"
+  debug_log "layout tab window=$window_id kind=$restore_kind profile=$profile cmd=$cmd"
+
+  ASM_ITERM_WINDOW_ID="$window_id" ASM_ITERM_CMD="$wrapped_cmd" ASM_ITERM_PROFILE="$profile" run_osascript_script 2 >/dev/null <<'APPLESCRIPT'
+set targetWindowId to (system attribute "ASM_ITERM_WINDOW_ID") as integer
+set shellCommand to system attribute "ASM_ITERM_CMD"
+set profileName to system attribute "ASM_ITERM_PROFILE"
+tell application "iTerm2"
+  activate
+  repeat 40 times
+    if exists window id targetWindowId then exit repeat
+    delay 0.05
+  end repeat
+  tell window id targetWindowId
+    if profileName is not "" then
+      set newTab to (create tab with profile profileName command shellCommand)
+    else
+      set newTab to (create tab with default profile command shellCommand)
+    end if
+  end tell
+  return ""
+end tell
+APPLESCRIPT
+}
+
+split_layout_session_in_iterm() {
+  local window_id="$1"
+  local direction="${2:-horizontal}"
+  local cmd="$3"
+  local restore_kind="${4:-command}"
+  local profile="${5:-}"
+  local wrapped_cmd
+  ensure_iterm_automation_ready || return 1
+  wrapped_cmd="$(build_iterm_launch_command "$restore_kind" "$cmd")"
+  debug_log "layout split window=$window_id direction=$direction kind=$restore_kind profile=$profile cmd=$cmd"
+
+  ASM_ITERM_WINDOW_ID="$window_id" ASM_ITERM_CMD="$wrapped_cmd" ASM_ITERM_PROFILE="$profile" ASM_ITERM_DIRECTION="$direction" run_osascript_script 2 >/dev/null <<'APPLESCRIPT'
+set targetWindowId to (system attribute "ASM_ITERM_WINDOW_ID") as integer
+set shellCommand to system attribute "ASM_ITERM_CMD"
+set profileName to system attribute "ASM_ITERM_PROFILE"
+set splitDirection to system attribute "ASM_ITERM_DIRECTION"
+
+tell application "iTerm2"
+  activate
+  repeat 40 times
+    if exists window id targetWindowId then exit repeat
+    delay 0.05
+  end repeat
+  tell current session of current tab of window id targetWindowId
+    if splitDirection is "vertical" then
+      if profileName is not "" then
+        split vertically with profile profileName command shellCommand
+      else
+        split vertically with default profile command shellCommand
+      end if
+    else
+      if profileName is not "" then
+        split horizontally with profile profileName command shellCommand
+      else
+        split horizontally with default profile command shellCommand
+      end if
+    end if
+  end tell
+end tell
+APPLESCRIPT
+}
+
+set_current_tab_title_in_iterm() {
+  local window_id="$1"
+  local tab_title="${2:-}"
+  [[ -n "$window_id" && -n "$tab_title" ]] || return 0
+  ensure_iterm_automation_ready || return 1
+
+  ASM_ITERM_WINDOW_ID="$window_id" ASM_ITERM_TAB_TITLE="$tab_title" run_osascript_script 2 >/dev/null <<'APPLESCRIPT'
+set targetWindowId to (system attribute "ASM_ITERM_WINDOW_ID") as integer
+set targetTabTitle to system attribute "ASM_ITERM_TAB_TITLE"
+
+tell application "iTerm2"
+  activate
+  repeat 40 times
+    if exists window id targetWindowId then exit repeat
+    delay 0.05
+  end repeat
+  tell current session of current tab of window id targetWindowId
+    set name to targetTabTitle
+  end tell
+end tell
+APPLESCRIPT
+}
+
+restore_iterm_snapshot_file() {
+  local snapshot_path="$1"
+  [[ -f "$snapshot_path" ]] || {
+    print -u2 -- "snapshot not found: $snapshot_path"
+    return 1
+  }
+  ensure_iterm_automation_ready || return 1
+
+  local window_json tab_json session_json first_session bounds direction cmd restore_kind profile new_window_id tab_title
+  while IFS= read -r window_json; do
+    [[ -n "$window_json" ]] || continue
+
+    tab_json="$(jq -c '.tabs[0] // empty' <<<"$window_json")"
+    [[ -n "$tab_json" ]] || continue
+
+    first_session="$(jq -c '.sessions[0] // empty' <<<"$tab_json")"
+    [[ -n "$first_session" ]] || continue
+
+    cmd="$(jq -r '.restore_command // ""' <<<"$first_session")"
+    restore_kind="$(jq -r '.restore_kind // "command"' <<<"$first_session")"
+    profile="$(jq -r '.profile // ""' <<<"$first_session")"
+    bounds="$(jq -r 'if (.bounds | length) == 4 then (.bounds | map(tostring) | join(",")) else "" end' <<<"$window_json")"
+    [[ -n "$cmd" ]] || cmd="cd $(shell_quote "$HOME")"
+
+    new_window_id="$(open_layout_window_in_iterm "$cmd" "$restore_kind" "$profile")"
+    [[ -n "$new_window_id" ]] || {
+      print -u2 -- "failed to create iTerm2 window"
+      return 1
+    }
+    sleep "$ASM_ITERM_RESTORE_DELAY"
+    apply_bounds_to_iterm_window "$new_window_id" "$bounds"
+
+    tab_title="$(jq -r '.tab_title // ""' <<<"$tab_json")"
+    direction="$(jq -r '.split_direction // "horizontal"' <<<"$tab_json")"
+    while IFS= read -r session_json; do
+      [[ -n "$session_json" ]] || continue
+      cmd="$(jq -r '.restore_command // ""' <<<"$session_json")"
+      restore_kind="$(jq -r '.restore_kind // "command"' <<<"$session_json")"
+      profile="$(jq -r '.profile // ""' <<<"$session_json")"
+      [[ -n "$cmd" ]] || cmd="cd $(shell_quote "$HOME")"
+      split_layout_session_in_iterm "$new_window_id" "$direction" "$cmd" "$restore_kind" "$profile"
+      sleep "$ASM_ITERM_RESTORE_DELAY"
+    done < <(jq -c '.sessions[1:][]?' <<<"$tab_json")
+    set_current_tab_title_in_iterm "$new_window_id" "$tab_title"
+
+    while IFS= read -r tab_json; do
+      [[ -n "$tab_json" ]] || continue
+      first_session="$(jq -c '.sessions[0] // empty' <<<"$tab_json")"
+      [[ -n "$first_session" ]] || continue
+      cmd="$(jq -r '.restore_command // ""' <<<"$first_session")"
+      restore_kind="$(jq -r '.restore_kind // "command"' <<<"$first_session")"
+      profile="$(jq -r '.profile // ""' <<<"$first_session")"
+      [[ -n "$cmd" ]] || cmd="cd $(shell_quote "$HOME")"
+      open_layout_tab_in_iterm "$new_window_id" "$cmd" "$restore_kind" "$profile"
+      sleep "$ASM_ITERM_RESTORE_DELAY"
+
+      tab_title="$(jq -r '.tab_title // ""' <<<"$tab_json")"
+      direction="$(jq -r '.split_direction // "horizontal"' <<<"$tab_json")"
+      while IFS= read -r session_json; do
+        [[ -n "$session_json" ]] || continue
+        cmd="$(jq -r '.restore_command // ""' <<<"$session_json")"
+        restore_kind="$(jq -r '.restore_kind // "command"' <<<"$session_json")"
+        profile="$(jq -r '.profile // ""' <<<"$session_json")"
+        [[ -n "$cmd" ]] || cmd="cd $(shell_quote "$HOME")"
+        split_layout_session_in_iterm "$new_window_id" "$direction" "$cmd" "$restore_kind" "$profile"
+        sleep "$ASM_ITERM_RESTORE_DELAY"
+      done < <(jq -c '.sessions[1:][]?' <<<"$tab_json")
+      set_current_tab_title_in_iterm "$new_window_id" "$tab_title"
+    done < <(jq -c '.tabs[1:][]?' <<<"$window_json")
+  done < <(jq -c '.windows[]?' "$snapshot_path")
+}
+
+extract_current_iterm_window_snapshot_file() {
+  local source_path="$1"
+  local target_path="$2"
+  local snapshot_name="${3:-current-window}"
+  [[ -f "$source_path" ]] || {
+    print -u2 -- "snapshot not found: $source_path"
+    return 1
+  }
+
+  jq --arg snapshot_name "$snapshot_name" '
+    (.windows | map(select(.is_current_window == true)) | .[0]) as $window
+    | if $window == null then
+        error("current iTerm2 window not found in snapshot")
+      else
+        {
+          version: (.version // 1),
+          created_at: (.created_at // ""),
+          snapshot_name: $snapshot_name,
+          host: (.host // ""),
+          window_count: 1,
+          session_count: ([ $window.tabs[]?.sessions[]? ] | length),
+          windows: [
+            $window
+            | .window_order = 1
+            | .is_current_window = true
+          ]
+        }
+      end
+  ' "$source_path" >"$target_path"
+}
+
+open_command_in_iterm_tab() {
+  local cmd="$1"
+  local wrapped_cmd
+  ensure_iterm_automation_ready || return 1
+  wrapped_cmd="exec /bin/zsh -ilc $(shell_quote "$cmd")"
+  debug_log "open in iTerm tab cmd=$cmd wrapped=$wrapped_cmd"
+  ASM_ITERM_CMD="$wrapped_cmd" run_osascript_script 2 <<'APPLESCRIPT'
+set shellCommand to system attribute "ASM_ITERM_CMD"
+tell application "iTerm2"
+  activate
+  if (count of windows) = 0 then
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+      write text shellCommand
+    end tell
+  else
+    tell current window
+      create tab with default profile
+      tell current session of current tab
+        write text shellCommand
+      end tell
+    end tell
+  end if
+end tell
+APPLESCRIPT
+}
+
+open_command_in_iterm_window() {
+  local cmd="$1"
+  local wrapped_cmd
+  ensure_iterm_automation_ready || return 1
+  wrapped_cmd="exec /bin/zsh -ilc $(shell_quote "$cmd")"
+  debug_log "open in iTerm window cmd=$cmd wrapped=$wrapped_cmd"
+  ASM_ITERM_CMD="$wrapped_cmd" run_osascript_script 2 <<'APPLESCRIPT'
+set shellCommand to system attribute "ASM_ITERM_CMD"
+tell application "iTerm2"
+  activate
+  set newWindow to (create window with default profile)
+  tell current session of newWindow
+    write text shellCommand
+  end tell
+end tell
+APPLESCRIPT
+}
+
+extract_ref_from_text() {
+  python3 - <<'PY'
+import re, sys
+text = sys.stdin.read()
+patterns = [
+    (r'claude(?:\s+--[^\s]+)*\s+--resume\s+([0-9a-fA-F-]{36})', 'claude:{}'),
+    (r'gemini --resume ([0-9a-fA-F-]{36})', 'gemini:{}'),
+    (r'cursor-agent --resume ([0-9a-fA-F-]{36})', 'cursor-agent:{}'),
+    (r'codex resume ([A-Za-z0-9._:-]+)', 'codex:{}'),
+    (r'opencode -s ([A-Za-z0-9._:-]+)', 'opencode:{}'),
+]
+found = None
+for pattern, fmt in patterns:
+    matches = re.findall(pattern, text)
+    if matches:
+        found = fmt.format(matches[-1])
+if found:
+    print(found)
+PY
+}
+
+import_current_iterm_tabs() {
+  local assignments
+  assignments="$(run_runtime_py import-iterm-tabs 3)"
+
+  [[ -n "$assignments" ]] || return 0
+
+  local row tab_name ref
+  while IFS=$'\t' read -r tab_name ref; do
+    [[ -n "$tab_name" && -n "$ref" ]] || continue
+    assign_ref_to_tab "$ref" "$tab_name"
+  done <<<"$assignments"
+}
+
+summon_tab_to_iterm() {
+  local cache_file="$1"
+  local active_tab="$2"
+  local mode="${3:-tab}"
+  local refs
+  refs="$(jq -r --arg active_tab "$active_tab" '
+    .[]
+    | select(($active_tab == "All") or ((.tab_name // "") == $active_tab))
+    | .ref
+  ' "$cache_file")"
+  [[ -n "$refs" ]] || return 0
+
+  local ref cmd
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    cmd="$(resume_command_for_ref "$cache_file" "$ref")"
+    if [[ "$mode" == "window" ]]; then
+      open_command_in_iterm_window "$cmd"
+    else
+      open_command_in_iterm_tab "$cmd"
+    fi
+    sleep 0.2
+  done <<<"$refs"
+}
+
+revive_session_flow() {
+  local cache_file="$1"
+  local ref="$2"
+  local agent session_id cwd title alias_text clone_supported action exact_resume_cmd
+
+  agent="${ref%%:*}"
+  session_id="${ref#*:}"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$(field_for_ref "$cache_file" "$ref" "cwd")")"
+  title="$(field_for_ref "$cache_file" "$ref" "title")"
+  alias_text="$(field_for_ref "$cache_file" "$ref" "alias")"
+  exact_resume_cmd="$(resume_command_for_ref "$cache_file" "$ref")"
+
+  if clone_command_for_ref "$cache_file" "$ref" >/dev/null 2>&1; then
+    clone_supported=1
+  else
+    clone_supported=0
+  fi
+
+  while true; do
+    local preview_cmd
+    preview_cmd="ASM_CACHE_FILE=$(shell_quote "$cache_file") command asm __revive_preview $(shell_quote "$ref") {1} 2>/dev/null || true"
+    action="$(
+      {
+        printf 'resume\tResume exact\tReopen the original %s session in %s\n' "$agent" "$(project_label "$cwd")"
+        printf 'tab\tResume in new iTerm tab\tOpen the exact session in a fresh iTerm2 tab\n'
+        printf 'window\tResume in new iTerm window\tOpen the exact session in a fresh iTerm2 window\n'
+        if [[ "$clone_supported" == "1" ]]; then
+          printf 'clone\tClone same-agent\tFork this %s session and continue in a new one\n' "$agent"
+        fi
+        printf 'handoff\tHandoff other-agent\tCreate a portable context bundle and continue elsewhere\n'
+        printf 'cd\tCd only\tJump to the original working directory\n'
+        printf 'export\tExport bundle\tSave a portable bundle without opening a session\n'
+        printf 'copy\tCopy ref\tCopy %s\n' "$ref"
+        printf 'back\tBack\tReturn to the session list\n'
+      } | fzf \
+            --height=45% \
+            --layout=reverse \
+            --border \
+            --margin=12%,14% \
+            --delimiter=$'\t' \
+            --with-nth=2.. \
+            --preview "$preview_cmd" \
+            --preview-window='right:56%,border-left,wrap' \
+            --prompt='revive> ' \
+            --header="How should this session come back?  ${alias_text:-$title}"
+    )" || return 1
+
+    action="${action%%$'\t'*}"
+    debug_log "revive action ref=$ref action=$action"
+
+    case "$action" in
+      resume)
+        update_last_opened "$ref"
+        emit_shell_cmd "$exact_resume_cmd"
+        return 0
+        ;;
+      tab)
+        update_last_opened "$ref"
+        emit_shell_cmd "command asm __iterm_tab $(shell_quote "$exact_resume_cmd")"
+        return 0
+        ;;
+      window)
+        update_last_opened "$ref"
+        emit_shell_cmd "command asm __iterm_window $(shell_quote "$exact_resume_cmd")"
+        return 0
+        ;;
+      clone)
+        update_last_opened "$ref"
+        emit_shell_cmd "$(clone_command_for_ref "$cache_file" "$ref")"
+        return 0
+        ;;
+      handoff)
+        local target_agent handoff_cmd
+        target_agent="$(choose_handoff_target)" || continue
+        handoff_cmd="$(handoff_command_for_ref "$cache_file" "$ref" "$target_agent")" || {
+          notice "handoff is available to codex, claude, or gemini"
+          continue
+        }
+        emit_shell_cmd "$handoff_cmd"
+        return 0
+        ;;
+      cd)
+        emit_shell_cmd "cd $(shell_quote "$cwd")"
+        return 0
+        ;;
+      export)
+        local out_file
+        out_file="$(export_bundle_for_ref "$cache_file" "$ref" portable)"
+        copy_to_clipboard "$out_file"
+        notice "exported: $out_file"
+        ;;
+      copy)
+        copy_to_clipboard "$ref"
+        notice "copied: $ref"
+        ;;
+      back)
+        return 1
+        ;;
+    esac
+  done
+}
+
+handoff_command_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local target_agent="$3"
+  local bundle_file agent session_id cached_cwd cwd
+
+  bundle_file="$(export_bundle_for_ref "$cache_file" "$ref" "$target_agent")"
+  agent="${ref%%:*}"
+  session_id="${ref#*:}"
+  cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  [[ -n "$cwd" ]] || cwd="$HOME"
+
+  case "$target_agent" in
+    codex)
+      print -r -- "cd $(shell_quote "$cwd") && codex \"\$(cat $(shell_quote "$bundle_file"))\""
+      ;;
+    claude)
+      print -r -- "cd $(shell_quote "$cwd") && claude --dangerously-skip-permissions \"\$(cat $(shell_quote "$bundle_file"))\""
+      ;;
+    gemini)
+      print -r -- "cd $(shell_quote "$cwd") && gemini \"\$(cat $(shell_quote "$bundle_file"))\""
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+print_recent_preview() {
+  local rec="$1"
+  local agent session_id title source_file recent
+
+  agent="$(jq -r '.agent' <<<"$rec")"
+  session_id="$(jq -r '.id' <<<"$rec")"
+  title="$(jq -r '.title // ""' <<<"$rec")"
+  source_file="$(jq -r '.source_file // ""' <<<"$rec")"
+  recent=""
+
+  case "$agent" in
+    codex)
+      recent="$(codex_recent_messages "$session_id")"
+      ;;
+    claude)
+      recent="$(claude_recent_messages "$session_id")"
+      ;;
+    opencode)
+      recent="$(opencode_recent_messages "$session_id")"
+      ;;
+    gemini)
+      recent="$(gemini_recent_messages "$source_file")"
+      ;;
+    cursor-agent)
+      recent="$(cursor_recent_messages "$session_id")"
+      if [[ -z "$recent" && -n "$title" ]]; then
+        recent=$'assistant\t'"$title"
+      fi
+      ;;
+  esac
+
+  if [[ -z "$recent" ]]; then
+    print -r -- "No recent preview available."
+    return 0
+  fi
+
+  local line role content
+  while IFS=$'\t' read -r role content; do
+    [[ -n "$content" ]] || continue
+    print -r -- "[$role] $(truncate_text "$content" 220)"
+  done <<<"$recent"
+}
+
+recent_preview_text_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local rec
+  rec="$(record_for_ref "$cache_file" "$ref")"
+  [[ -n "$rec" ]] || return 0
+  print_recent_preview "$rec"
+}
+
+preview_ref() {
+  local ref="$1"
+  local cache_file="${ASM_CACHE_FILE:-}"
+  [[ -n "$cache_file" && -f "$cache_file" ]] || return 0
+
+  local rec
+  rec="$(record_for_ref "$cache_file" "$ref")"
+  [[ -n "$rec" ]] || return 0
+
+  local agent session_id title alias_text pinned cached_cwd cwd updated_display tags_text
+  agent="$(jq -r '.agent' <<<"$rec")"
+  session_id="$(jq -r '.id' <<<"$rec")"
+  title="$(jq -r '.title // ""' <<<"$rec")"
+  alias_text="$(jq -r '.alias // ""' <<<"$rec")"
+  pinned="$(jq -r '.pinned // 0' <<<"$rec")"
+  cached_cwd="$(jq -r '.cwd // ""' <<<"$rec")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  updated_display="$(jq -r '.updated_display // ""' <<<"$rec")"
+  tags_text="$(jq -r '.tags_text // ""' <<<"$rec")"
+
+  print -r -- "Agent:        $agent"
+  print -r -- "Session:      $session_id"
+  print -r -- "Pinned:       $([[ "$pinned" == "1" ]] && print yes || print no)"
+  print -r -- "Alias:        ${alias_text:-"-"}"
+  print -r -- "Title:        ${title:-"-"}"
+  print -r -- "Tags:         ${tags_text:-"-"}"
+  print -r -- "Cwd:          ${cwd:-$HOME}"
+  print -r -- "Updated:      ${updated_display:-"-"}"
+  print
+  print -r -- "Transcript:"
+  print_recent_preview "$rec"
+  print
+  print -r -- "Resume:"
+  resume_command_for_ref "$cache_file" "$ref" || true
+  print
+  print -r -- "Clone:"
+  clone_command_for_ref "$cache_file" "$ref" || print -r -- "same-agent clone is not available for $agent"
+  print
+  print -r -- "Keys:"
+  print -r -- "enter revive menu | ctrl-p pin | ctrl-t tags | alt-a alias | ctrl-y copy ref | ctrl-o cd | alt-c clone | alt-h handoff"
+}
+
+prompt_alias() {
+  local current_alias="$1"
+  print -n -- "Alias [${current_alias}]: " >/dev/tty
+  local new_alias
+  IFS= read -r new_alias </dev/tty || true
+  if [[ -z "$new_alias" ]]; then
+    print -r -- "$current_alias"
+  else
+    print -r -- "$new_alias"
+  fi
+}
+
+pick_ref_interactive() {
+  local query="${1:-}"
+  local mode="${2:-action}"
+  local cache_file state_file
+  cache_file="$(mktemp)"
+  state_file="$(mktemp)"
+  build_cache >"$cache_file"
+  picker_state_write "$state_file" "session"
+  debug_log "picker open mode=$mode query=${query:-}"
+
+  local header key current_tab
+  current_tab="$(get_active_tab_name)"
+  set_active_tab_name "$current_tab"
+  while true; do
+    header="$(ASM_FORCE_COLOR=1 command asm __picker_header $(shell_quote "$cache_file") $(shell_quote "$state_file"))"
+    local render_cmd pin_cmd refresh_cmd shift_left_cmd shift_right_cmd header_cmd prompt_cmd tab_target_cmd back_mode_cmd
+    render_cmd="ASM_FORCE_COLOR=1 command asm __render_picker_rows $(shell_quote "$cache_file") $(shell_quote "$state_file")"
+    pin_cmd="command asm __toggle_pin_cache $(shell_quote "$cache_file") {+1}"
+    refresh_cmd="command asm __refresh_cache $(shell_quote "$cache_file")"
+    shift_left_cmd="command asm __picker_shift_active_tab $(shell_quote "$state_file") left"
+    shift_right_cmd="command asm __picker_shift_active_tab $(shell_quote "$state_file") right"
+    header_cmd="ASM_FORCE_COLOR=1 command asm __picker_header $(shell_quote "$cache_file") $(shell_quote "$state_file")"
+    prompt_cmd="command asm __picker_prompt $(shell_quote "$state_file")"
+    tab_target_cmd="command asm __picker_enter_tab_target $(shell_quote "$state_file") {+1}"
+    back_mode_cmd="command asm __picker_leave_mode $(shell_quote "$state_file")"
+    local selection
+    selection="$(
+      ASM_FORCE_COLOR=1 render_picker_rows "$cache_file" "$state_file" \
+        | ASM_CACHE_FILE="$cache_file" ASM_FORCE_COLOR=1 fzf \
+            --height=100% \
+            --layout=reverse \
+            --border \
+            --ansi \
+            --multi \
+            --info=inline-right \
+            --delimiter=$'\t' \
+            --with-nth=2.. \
+            --expect=esc,enter,ctrl-t,ctrl-n,alt-s,alt-w,alt-i,alt-a,ctrl-y,ctrl-o,alt-c,alt-h \
+            --bind "ctrl-p:execute-silent($pin_cmd)+reload($render_cmd)" \
+            --bind "ctrl-r:execute-silent($refresh_cmd)+reload($render_cmd)" \
+            --bind "shift-up:toggle+up" \
+            --bind "shift-down:toggle+down" \
+            --bind "tab:execute-silent($tab_target_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)+refresh-preview" \
+            --bind "alt-m:execute-silent($tab_target_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)+refresh-preview" \
+            --bind "btab:execute-silent($back_mode_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)+refresh-preview" \
+            --bind "left:execute-silent($shift_left_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)" \
+            --bind "right:execute-silent($shift_right_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)" \
+            --bind='pgup:preview-page-up,pgdn:preview-page-down' \
+            --track \
+            --preview "command asm __picker_preview $(shell_quote "$cache_file") $(shell_quote "$state_file") {1} 2>/dev/null || true" \
+            --preview-window='right:60%,border-left,wrap' \
+            --header "$header" \
+            --prompt="$(cmd_picker_prompt "$state_file")" \
+            ${query:+-q "$query"}
+    )" || {
+      rm -f "$cache_file"
+      rm -f "$state_file"
+      return 1
+    }
+
+    local picker_mode selection_lines refs session_refs ref primary_ref
+    picker_mode="$(picker_state_mode "$state_file")"
+    selection_lines=("${(@f)selection}")
+    key="${selection_lines[1]}"
+    if [[ "$key" == "esc" ]]; then
+      if [[ "$picker_mode" == "tab-target" ]]; then
+        picker_state_write "$state_file" "session"
+        current_tab="$(get_active_tab_name)"
+        continue
+      fi
+      rm -f "$cache_file" "$state_file"
+      return 1
+    fi
+    if [[ -z "$key" || "$key" == *$'\t'* ]]; then
+      key=""
+      refs=()
+      local entry
+      for entry in "${selection_lines[@]}"; do
+        [[ -n "$entry" ]] || continue
+        refs+=("${entry%%$'\t'*}")
+      done
+    else
+      refs=()
+      local entry
+      for entry in "${selection_lines[@]:1}"; do
+        [[ -n "$entry" ]] || continue
+        refs+=("${entry%%$'\t'*}")
+      done
+    fi
+    if [[ ${#refs[@]} -eq 0 ]]; then
+      debug_log "picker key=$key with no refs; waiting for next stable selection"
+      current_tab="$(get_active_tab_name)"
+      continue
+    fi
+    session_refs=()
+    local picked
+    for picked in "${refs[@]}"; do
+      session_refs+=("$picked")
+    done
+    primary_ref="${refs[1]}"
+    debug_log "picker key=$key refs=${(j:,:)refs} mode=$mode"
+    current_tab="$(get_active_tab_name)"
+
+    case "$key" in
+      enter|'')
+        if [[ "$picker_mode" == "tab-target" ]]; then
+          local target_ref target_tab
+          session_refs=("${(@f)$(picker_state_refs "$state_file")}")
+          target_ref="$primary_ref"
+          case "$target_ref" in
+            __tab_target__:__pin_on__)
+              set_pin_in_cache "$cache_file" 1 "${session_refs[@]}"
+              ;;
+            __tab_target__:__pin_off__)
+              set_pin_in_cache "$cache_file" 0 "${session_refs[@]}"
+              ;;
+            __tab_target__:All)
+              remove_ref_from_cache_tab "$cache_file" "${session_refs[@]}"
+              ;;
+            __tab_target__:+new)
+              target_tab="$(prompt_tab_name)"
+              [[ -n "$target_tab" ]] && assign_ref_to_cache_tab "$cache_file" "$target_tab" "${session_refs[@]}"
+              ;;
+            __tab_target__:* )
+              target_tab="${target_ref#__tab_target__:}"
+              assign_ref_to_cache_tab "$cache_file" "$target_tab" "${session_refs[@]}"
+              ;;
+          esac
+          picker_state_write "$state_file" "session"
+          current_tab="$(get_active_tab_name)"
+          continue
+        fi
+        if [[ "$mode" == "select" ]]; then
+          print -r -- "$primary_ref"
+          rm -f "$cache_file"
+          rm -f "$state_file"
+          return 0
+        fi
+        if [[ -n "${ASM_CMD_FILE:-}" ]]; then
+          emit_shell_cmd "ASM_CMD_FILE=$(shell_quote "$ASM_CMD_FILE") command asm revive $(shell_quote "$primary_ref")"
+          rm -f "$cache_file"
+          rm -f "$state_file"
+          return 0
+        fi
+        if revive_session_flow "$cache_file" "$primary_ref"; then
+          rm -f "$cache_file"
+          rm -f "$state_file"
+          return 0
+        fi
+        ;;
+      ctrl-t)
+        tag_ref_interactive "$cache_file" "$primary_ref"
+        current_tab="$(get_active_tab_name)"
+        ;;
+      ctrl-n)
+        local new_tab_name
+        new_tab_name="$(prompt_tab_name)"
+        [[ -n "$new_tab_name" ]] || continue
+        assign_ref_to_cache_tab "$cache_file" "$new_tab_name" "${session_refs[@]}"
+        current_tab="$new_tab_name"
+        set_active_tab_name "$current_tab"
+        ;;
+      alt-s)
+        if [[ "$current_tab" == "All" ]]; then
+          notice "summon tab works on a custom tab, not All"
+          continue
+        fi
+        emit_shell_cmd "command asm __summon_tab $(shell_quote "$current_tab") tab"
+        rm -f "$cache_file"
+        rm -f "$state_file"
+        return 0
+        ;;
+      alt-w)
+        if [[ "$current_tab" == "All" ]]; then
+          notice "summon window works on a custom tab, not All"
+          continue
+        fi
+        emit_shell_cmd "command asm __summon_tab $(shell_quote "$current_tab") window"
+        rm -f "$cache_file"
+        rm -f "$state_file"
+        return 0
+        ;;
+      alt-i)
+        import_current_iterm_tabs
+        refresh_cache_file "$cache_file"
+        current_tab="$(get_active_tab_name)"
+        ;;
+      alt-a)
+        local current_alias next_alias
+        current_alias="$(field_for_ref "$cache_file" "$primary_ref" "alias")"
+        next_alias="$(prompt_alias "$current_alias")"
+        set_alias_for_ref "$primary_ref" "$next_alias"
+        build_cache >"$cache_file"
+        ;;
+      ctrl-y)
+        copy_to_clipboard "${(j:$'\n':)refs}"
+        notice "copied: ${#refs[@]} ref(s)"
+        ;;
+      ctrl-o)
+        emit_shell_cmd "cd $(shell_quote "$(resolve_cwd "${primary_ref%%:*}" "${primary_ref#*:}" "$(field_for_ref "$cache_file" "$primary_ref" "cwd")")")"
+        rm -f "$cache_file"
+        rm -f "$state_file"
+        return 0
+        ;;
+      alt-c)
+        local clone_cmd
+        clone_cmd="$(clone_command_for_ref "$cache_file" "$primary_ref")" || {
+          notice "clone is not available for ${primary_ref%%:*}"
+          continue
+        }
+        update_last_opened "$primary_ref"
+        emit_shell_cmd "$clone_cmd"
+        rm -f "$cache_file"
+        rm -f "$state_file"
+        return 0
+        ;;
+      alt-h)
+        local target_agent handoff_cmd
+        target_agent="$(choose_handoff_target)" || continue
+        handoff_cmd="$(handoff_command_for_ref "$cache_file" "$primary_ref" "$target_agent")" || {
+          notice "handoff is available to codex, claude, or gemini"
+          continue
+        }
+        emit_shell_cmd "$handoff_cmd"
+        rm -f "$cache_file"
+        rm -f "$state_file"
+        return 0
+        ;;
+      *)
+        ;;
+    esac
+  done
+}
+
+resolve_ref_argument() {
+  if [[ $# -gt 0 && "$1" == *:* ]]; then
+    print -r -- "$1"
+  else
+    pick_ref_interactive "$*" select
+  fi
+}
+
+print_list() {
+  local cache_file
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  render_lines "$cache_file"
+  rm -f "$cache_file"
+}
+
+print_usage() {
+  cat <<'EOF'
+asm - AI session manager
+
+Usage:
+  asm
+  asm [QUERY]
+  asm <command> [args]
+
+Commands:
+  help, -h, --help   Show this help
+  doctor             Check runtime dependencies and environment
+  self-test          Run dev regression checks in an isolated temp HOME
+  init [zsh|bash|fish]
+  setup
+  list
+  resume <agent:session>
+  clone <agent:session>
+  handoff [--to codex|claude|gemini] <agent:session>
+  revive <agent:session>
+  export <agent:session>
+  pin <agent:session>
+  alias <agent:session> [name]
+  iterm-save [name]
+  iterm-restore [name]
+  iterm-list
+  iterm-clone-current
+
+Keys in picker:
+  left/right         Switch tabs
+  shift-up/down      Multi-select
+  enter              Revive menu
+  ctrl-p             Toggle pin
+  ctrl-r             Reload sessions
+  ctrl-t             Toggle tags
+  tab                Tab action menu
+  ctrl-n             New tab from selection
+EOF
+}
+
+print_usage_stderr() {
+  print_usage >&2
+}
+
+cmd_doctor() {
+  local missing=0
+  local iterm_installed_state="false"
+  local iterm_running_state="false"
+  local iterm_windows_state="0"
+  local apple_events_state="false"
+  print -r -- "Environment"
+  print -r -- "  shell: ${SHELL:-unknown}"
+  print -r -- "  platform: $(uname -s) $(uname -m)"
+  print -r -- "  shell integration: $(if [[ -n "${ASM_CMD_FILE:-}" ]]; then print active; else print inactive; fi)"
+  print
+  print -r -- "Bundle files"
+  if [[ -f "$ASM_SCRIPT_PATH" ]]; then
+    print -r -- "  [ok] asm -> $ASM_SCRIPT_PATH"
+  else
+    print -r -- "  [missing] asm -> $ASM_SCRIPT_PATH"
+    missing=1
+  fi
+  if runtime_helper_exists; then
+    print -r -- "  [ok] asm_runtime.py -> $ASM_RUNTIME_PY"
+  else
+    print -r -- "  [missing] asm_runtime.py -> $ASM_RUNTIME_PY"
+    missing=1
+  fi
+  if selftest_helper_exists; then
+    print -r -- "  [ok] asm_selftest.py -> $ASM_SELFTEST_PY"
+  else
+    print -r -- "  [optional-missing] asm_selftest.py -> $ASM_SELFTEST_PY"
+  fi
+  print
+  print -r -- "Dependencies"
+  local dep
+  for dep in sqlite3 jq fzf python3 osascript lsof pbcopy rg; do
+    if command_exists "$dep"; then
+      print -r -- "  [ok] $dep -> $(command -v "$dep")"
+    else
+      print -r -- "  [missing] $dep"
+      missing=1
+    fi
+  done
+  print
+  print -r -- "Platform scope"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    print -r -- "  macOS features enabled"
+    if iterm_installed; then
+      iterm_installed_state="true"
+    fi
+    if iterm_running; then
+      iterm_running_state="true"
+    fi
+    iterm_windows_state="$(iterm_window_count 2>/dev/null || print 0)"
+    if iterm_apple_events_ok; then
+      apple_events_state="true"
+    fi
+    print -r -- "  iTerm2 installed: $iterm_installed_state"
+    print -r -- "  iTerm2 running: $iterm_running_state"
+    print -r -- "  iTerm2 windows: $iterm_windows_state"
+    print -r -- "  AppleScript to iTerm2: $apple_events_state"
+  else
+    print -r -- "  non-macOS: iTerm integration unavailable"
+  fi
+  print
+  print -r -- "Runtime"
+  print -r -- "  max sessions: $ASM_MAX_SESSIONS"
+  print -r -- "  cache ttl: $ASM_CACHE_TTL_SECONDS"
+  print -r -- "  cache file: $ASM_SESSION_CACHE_FILE"
+  return "$missing"
+}
+
+cmd_self_test() {
+  if ! selftest_helper_exists; then
+    print -u2 -- "self-test file not found: $ASM_SELFTEST_PY"
+    return 1
+  fi
+  python3 "$ASM_SELFTEST_PY" "$ASM_SCRIPT_PATH"
+}
+
+cmd_init() {
+  local shell_name="${1:-zsh}"
+  case "$shell_name" in
+    zsh|bash)
+      cat <<'EOF'
+function asm() {
+    local tmpfile
+    tmpfile="$(mktemp)" || return 1
+    ASM_CMD_FILE="$tmpfile" command asm "$@"
+    local ret=$?
+    if [ $ret -eq 0 ] && [ -f "$tmpfile" ]; then
+        local result
+        result="$(cat "$tmpfile")"
+        if [ -n "$result" ]; then
+            eval "$result"
+        fi
+    fi
+    rm -f "$tmpfile"
+    return $ret
+}
+EOF
+      ;;
+    fish)
+      cat <<'EOF'
+function asm
+    set -l tmpfile (mktemp)
+    or return 1
+    env ASM_CMD_FILE="$tmpfile" command asm $argv
+    set -l ret $status
+    if test $ret -eq 0 -a -f "$tmpfile"
+        set -l result (cat "$tmpfile")
+        if test -n "$result"
+            eval "$result"
+        end
+    end
+    rm -f "$tmpfile"
+    return $ret
+end
+EOF
+      ;;
+    *)
+      print -u2 -- "unsupported shell: $shell_name"
+      return 1
+      ;;
+  esac
+}
+
+cmd_setup() {
+  local shell_path shell_name rc_file init_line
+  shell_path="${SHELL:-/bin/zsh}"
+  shell_name="${shell_path##*/}"
+
+  case "$shell_name" in
+    zsh)
+      rc_file="$HOME/.zshrc"
+      init_line='eval "$(asm init zsh)"'
+      ;;
+    bash)
+      rc_file="$HOME/.bashrc"
+      init_line='eval "$(asm init bash)"'
+      ;;
+    fish)
+      rc_file="$HOME/.config/fish/config.fish"
+      init_line='asm init fish | source'
+      mkdir -p "$HOME/.config/fish"
+      ;;
+    *)
+      print -u2 -- "unsupported shell: $shell_name"
+      return 1
+      ;;
+  esac
+
+  touch "$rc_file"
+  if grep -Fqx "$init_line" "$rc_file" 2>/dev/null; then
+    print -r -- "already configured: $rc_file"
+    return 0
+  fi
+
+  {
+    print
+    print -r -- "$init_line"
+  } >>"$rc_file"
+
+  print -r -- "added to $rc_file"
+}
+
+cmd_pin() {
+  local ref
+  ref="$(resolve_ref_argument "$@")" || return 1
+  toggle_pin "$ref"
+  print -r -- "$ref"
+}
+
+cmd_alias() {
+  local ref alias_text
+  ref="$(resolve_ref_argument "${1:-}")" || return 1
+  shift || true
+  if [[ $# -gt 0 ]]; then
+    alias_text="$*"
+  else
+    alias_text="$(prompt_alias "")"
+  fi
+  set_alias_for_ref "$ref" "$alias_text"
+  print -r -- "$ref"
+}
+
+cmd_resume() {
+  local ref cache_file cmd
+  ref="$(resolve_ref_argument "$@")" || return 1
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  cmd="$(resume_command_for_ref "$cache_file" "$ref")"
+  rm -f "$cache_file"
+  update_last_opened "$ref"
+  emit_shell_cmd "$cmd"
+}
+
+cmd_clone() {
+  local ref cache_file cmd
+  ref="$(resolve_ref_argument "$@")" || return 1
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  cmd="$(clone_command_for_ref "$cache_file" "$ref")"
+  rm -f "$cache_file"
+  update_last_opened "$ref"
+  emit_shell_cmd "$cmd"
+}
+
+cmd_export() {
+  local ref cache_file out_file
+  ref="$(resolve_ref_argument "$@")" || return 1
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  out_file="$(export_bundle_for_ref "$cache_file" "$ref" portable)"
+  rm -f "$cache_file"
+  copy_to_clipboard "$out_file"
+  print -r -- "$out_file"
+}
+
+cmd_handoff() {
+  local target_agent=""
+  if [[ "${1:-}" == "--to" ]]; then
+    target_agent="${2:-}"
+    shift 2
+  fi
+  [[ -n "$target_agent" ]] || target_agent="$(choose_handoff_target)"
+  [[ -n "$target_agent" ]] || return 1
+
+  local ref cache_file cmd
+  ref="$(resolve_ref_argument "$@")" || return 1
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  cmd="$(handoff_command_for_ref "$cache_file" "$ref" "$target_agent")"
+  rm -f "$cache_file"
+  emit_shell_cmd "$cmd"
+}
+
+cmd_revive() {
+  local ref cache_file
+  ref="$(resolve_ref_argument "$@")" || return 1
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  revive_session_flow "$cache_file" "$ref"
+  rm -f "$cache_file"
+}
+
+cmd_preview() {
+  local cache_file=""
+  if [[ -z "${ASM_CACHE_FILE:-}" || ! -f "${ASM_CACHE_FILE:-}" ]]; then
+    cache_file="$(mktemp)"
+    build_cache >"$cache_file"
+    ASM_CACHE_FILE="$cache_file" preview_ref "${1:-}"
+    rm -f "$cache_file"
+  else
+    preview_ref "${1:-}"
+  fi
+}
+
+cmd_render_cache() {
+  render_lines "$1"
+}
+
+cmd_render_active_cache() {
+  [[ -f "$1" ]] || return 0
+  render_lines "$1" "$(get_active_tab_name)"
+}
+
+cmd_render_picker_rows() {
+  [[ -f "$1" ]] || return 0
+  render_picker_rows "$1" "$2"
+}
+
+cmd_merge_cache_payload() {
+  merge_cache_payload "$1" "$2" "$3" "$4"
+}
+
+cmd_toggle_pin_cache() {
+  toggle_pin_in_cache "$1" "$2"
+}
+
+cmd_refresh_cache() {
+  refresh_cache_file "$1"
+}
+
+cmd_move_to_tab_modal() {
+  local cache_file="$1"
+  shift
+  move_refs_to_tab_interactive "$cache_file" "$@"
+}
+
+cmd_shift_active_tab() {
+  local direction="$1"
+  local next_tab
+  next_tab="$(shift_tab_name "$(get_active_tab_name)" "$direction")"
+  set_active_tab_name "$next_tab"
+}
+
+cmd_header_text() {
+  picker_header_text "$(get_active_tab_name)" "${ASM_CACHE_FILE:-$ASM_SESSION_CACHE_FILE}"
+}
+
+cmd_prompt_text() {
+  local tab mode
+  tab="$(get_active_tab_name)"
+  mode="$(shell_mode_label)"
+  if [[ "$mode" == "integrated" ]]; then
+    printf 'asm[%s] → ' "$tab"
+  else
+    printf 'asm[%s|child] → ' "$tab"
+  fi
+}
+
+cmd_picker_header() {
+  local cache_file="$1"
+  local state_file="$2"
+  local mode
+  mode="$(picker_state_mode "$state_file")"
+  if [[ "$mode" == "tab-target" ]]; then
+    local selected_count
+    selected_count="$(picker_state_refs "$state_file" | awk 'NF{c++} END{print c+0}')"
+    printf 'TAB ACTION · %s selected · enter apply · esc/shift-tab back' "$selected_count"
+  else
+    picker_header_text "$(get_active_tab_name)" "$cache_file"
+  fi
+}
+
+cmd_picker_prompt() {
+  local state_file="$1"
+  local mode
+  mode="$(picker_state_mode "$state_file")"
+  if [[ "$mode" == "tab-target" ]]; then
+    printf 'tab-action> '
+  else
+    cmd_prompt_text
+  fi
+}
+
+cmd_picker_preview() {
+  local cache_file="$1"
+  local state_file="$2"
+  local ref="${3:-}"
+  local mode
+  mode="$(picker_state_mode "$state_file")"
+  if [[ "$mode" != "tab-target" ]]; then
+    preview_ref "$ref"
+    return 0
+  fi
+
+  local saved_count
+  saved_count="$(picker_state_refs "$state_file" | awk 'NF{c++} END{print c+0}')"
+  case "$ref" in
+    __tab_target__:__pin_on__)
+      print -r -- "Pin ${saved_count} selected session(s) so they stay at the top."
+      ;;
+    __tab_target__:__pin_off__)
+      print -r -- "Remove pin from ${saved_count} selected session(s)."
+      ;;
+    __tab_target__:All)
+      print -r -- "Remove ${saved_count} selected session(s) from any custom tab."
+      ;;
+    __tab_target__:+new)
+      print -r -- "Create a new tab name, then move ${saved_count} selected session(s) into it."
+      ;;
+    __tab_target__:* )
+      print -r -- "Move ${saved_count} selected session(s) to tab:"
+      print -r -- "${ref#__tab_target__:}"
+      ;;
+    *)
+      print -r -- "Choose a target tab."
+      ;;
+  esac
+}
+
+cmd_picker_enter_tab_target() {
+  local state_file="$1"
+  shift
+  [[ $# -gt 0 ]] || return 0
+  picker_state_write "$state_file" "tab-target" "$@"
+}
+
+cmd_picker_leave_mode() {
+  local state_file="$1"
+  picker_state_write "$state_file" "session"
+}
+
+cmd_picker_shift_active_tab() {
+  local state_file="$1"
+  local direction="$2"
+  [[ "$(picker_state_mode "$state_file")" == "session" ]] || return 0
+  cmd_shift_active_tab "$direction"
+}
+
+cmd_summon_tab() {
+  local active_tab="$1"
+  local mode="${2:-tab}"
+  local cache_file
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  summon_tab_to_iterm "$cache_file" "$active_tab" "$mode"
+  rm -f "$cache_file"
+}
+
+cmd_import_iterm_tabs() {
+  import_current_iterm_tabs
+}
+
+cmd_extract_current_iterm_window_snapshot() {
+  extract_current_iterm_window_snapshot_file "$1" "$2" "${3:-current-window}"
+}
+
+cmd_iterm_save() {
+  local snapshot_name snapshot_path tmp_file session_count window_count
+  snapshot_name="$(normalize_snapshot_name "${1:-latest}")"
+  snapshot_path="$(iterm_snapshot_path "$snapshot_name")"
+  tmp_file="$(mktemp)"
+
+  build_current_iterm_snapshot \
+    | jq --arg snapshot_name "$snapshot_name" '. + {snapshot_name: $snapshot_name}' >"$tmp_file" || {
+      rm -f "$tmp_file"
+      return 1
+    }
+
+  mv "$tmp_file" "$snapshot_path"
+  session_count="$(jq -r '.session_count // 0' "$snapshot_path" 2>/dev/null || print 0)"
+  window_count="$(jq -r '.window_count // 0' "$snapshot_path" 2>/dev/null || print 0)"
+  print -r -- "$snapshot_path"
+  print -r -- "saved ${window_count} windows / ${session_count} sessions"
+}
+
+cmd_iterm_restore() {
+  local snapshot_name snapshot_path session_count window_count
+  snapshot_name="$(normalize_snapshot_name "${1:-latest}")"
+  snapshot_path="$(iterm_snapshot_path "$snapshot_name")"
+  restore_iterm_snapshot_file "$snapshot_path" || return 1
+  session_count="$(jq -r '.session_count // 0' "$snapshot_path" 2>/dev/null || print 0)"
+  window_count="$(jq -r '.window_count // 0' "$snapshot_path" 2>/dev/null || print 0)"
+  print -r -- "$snapshot_path"
+  print -r -- "restored ${window_count} windows / ${session_count} sessions"
+}
+
+cmd_iterm_clone_current() {
+  local tmp_snapshot tmp_current tab_count session_count
+  tmp_snapshot="$(mktemp)"
+  tmp_current="$(mktemp)"
+
+  build_current_iterm_snapshot >"$tmp_snapshot" || {
+    rm -f "$tmp_snapshot" "$tmp_current"
+    return 1
+  }
+
+  extract_current_iterm_window_snapshot_file "$tmp_snapshot" "$tmp_current" "current-window" || {
+    rm -f "$tmp_snapshot" "$tmp_current"
+    return 1
+  }
+
+  restore_iterm_snapshot_file "$tmp_current" || {
+    rm -f "$tmp_snapshot" "$tmp_current"
+    return 1
+  }
+
+  tab_count="$(jq -r '[.windows[0].tabs[]?] | length' "$tmp_current" 2>/dev/null || print 0)"
+  session_count="$(jq -r '.session_count // 0' "$tmp_current" 2>/dev/null || print 0)"
+  rm -f "$tmp_snapshot" "$tmp_current"
+  print -r -- "cloned current iTerm2 window: ${tab_count} tabs / ${session_count} sessions"
+}
+
+cmd_iterm_list() {
+  local file name created_at window_count session_count
+  for file in "$ASM_ITERM_LAYOUT_DIR"/*.json(N); do
+    name="${file:t:r}"
+    created_at="$(jq -r '.created_at // "-"' "$file" 2>/dev/null || print -r -- "-")"
+    window_count="$(jq -r '.window_count // 0' "$file" 2>/dev/null || print -r -- "0")"
+    session_count="$(jq -r '.session_count // 0' "$file" 2>/dev/null || print -r -- "0")"
+    printf '%-20s  %-20s  %2s windows  %3s sessions\n' "$name" "$created_at" "$window_count" "$session_count"
+  done
+}
+
+cmd_revive_preview() {
+  local ref="${1:-}"
+  local action="${2:-}"
+  local cache_file="${ASM_CACHE_FILE:-}"
+  [[ -n "$cache_file" && -f "$cache_file" ]] || {
+    cache_file="$(mktemp)"
+    build_cache >"$cache_file"
+  }
+
+  local rec
+  rec="$(record_for_ref "$cache_file" "$ref")"
+  [[ -n "$rec" ]] || return 0
+
+  local title alias_text cwd updated_display summary
+  title="$(jq -r '.title // ""' <<<"$rec")"
+  alias_text="$(jq -r '.alias // ""' <<<"$rec")"
+  cwd="$(resolve_cwd "$(jq -r '.agent' <<<"$rec")" "$(jq -r '.id' <<<"$rec")" "$(jq -r '.cwd // ""' <<<"$rec")")"
+  updated_display="$(jq -r '.updated_display // ""' <<<"$rec")"
+
+  print -r -- "Action:  $action"
+  case "$action" in
+    resume)
+      print -r -- "Exact session revival in the same agent."
+      print
+      print -r -- "Command:"
+      resume_command_for_ref "$cache_file" "$ref" || true
+      ;;
+    clone)
+      print -r -- "Fork the same-agent context into a fresh session."
+      print
+      print -r -- "Command:"
+      clone_command_for_ref "$cache_file" "$ref" || print -r -- "same-agent clone is not available"
+      ;;
+    handoff)
+      print -r -- "Next step will ask which target agent should receive a portable bundle."
+      ;;
+    cd)
+      print -r -- "Jump to the original working directory only."
+      print
+      print -r -- "Command:"
+      print -r -- "cd $(shell_quote "$cwd")"
+      ;;
+    export)
+      print -r -- "Write a portable handoff bundle to disk and copy the path."
+      ;;
+    tab)
+      print -r -- "Open the exact resume command in a new iTerm2 tab."
+      print
+      print -r -- "Command:"
+      resume_command_for_ref "$cache_file" "$ref" || true
+      ;;
+    window)
+      print -r -- "Open the exact resume command in a new iTerm2 window."
+      print
+      print -r -- "Command:"
+      resume_command_for_ref "$cache_file" "$ref" || true
+      ;;
+    copy)
+      print -r -- "Copy the raw session ref."
+      print
+      print -r -- "$ref"
+      ;;
+    back)
+      print -r -- "Return to the session list without doing anything."
+      ;;
+  esac
+  print
+  print -r -- "Session:"
+  print -r -- "${alias_text:-$title}"
+  print -r -- "cwd: $cwd"
+  print -r -- "updated: $updated_display"
+  print
+  print -r -- "Transcript:"
+  print_recent_preview "$rec"
+}
+
+main() {
+  ensure_storage
+  debug_log "main argv=$*"
+
+  local subcmd="${1:-}"
+  case "$subcmd" in
+    -h|--help|help)
+      print_usage
+      ;;
+    doctor)
+      shift
+      cmd_doctor "$@"
+      ;;
+    self-test)
+      shift
+      cmd_self_test "$@"
+      ;;
+    init)
+      shift
+      cmd_init "$@"
+      ;;
+    setup)
+      shift
+      cmd_setup "$@"
+      ;;
+    list)
+      shift
+      print_list "$@"
+      ;;
+    pin)
+      shift
+      cmd_pin "$@"
+      ;;
+    alias)
+      shift
+      cmd_alias "$@"
+      ;;
+    resume)
+      shift
+      cmd_resume "$@"
+      ;;
+    clone)
+      shift
+      cmd_clone "$@"
+      ;;
+    export)
+      shift
+      cmd_export "$@"
+      ;;
+    iterm-save)
+      shift
+      cmd_iterm_save "$@"
+      ;;
+    iterm-restore)
+      shift
+      cmd_iterm_restore "$@"
+      ;;
+    iterm-list)
+      shift
+      cmd_iterm_list "$@"
+      ;;
+    iterm-clone-current)
+      shift
+      cmd_iterm_clone_current "$@"
+      ;;
+    handoff)
+      shift
+      cmd_handoff "$@"
+      ;;
+    revive)
+      shift
+      cmd_revive "$@"
+      ;;
+    __revive_preview)
+      shift
+      cmd_revive_preview "$@"
+      ;;
+    __render_cache)
+      shift
+      cmd_render_cache "$@"
+      ;;
+    __render_active_cache)
+      shift
+      cmd_render_active_cache "$@"
+      ;;
+    __render_picker_rows)
+      shift
+      cmd_render_picker_rows "$@"
+      ;;
+    __merge_cache_payload)
+      shift
+      cmd_merge_cache_payload "$@"
+      ;;
+    __toggle_pin_cache)
+      shift
+      cmd_toggle_pin_cache "$@"
+      ;;
+    __refresh_cache)
+      shift
+      cmd_refresh_cache "$@"
+      ;;
+    __move_to_tab_modal)
+      shift
+      cmd_move_to_tab_modal "$@"
+      ;;
+    __shift_active_tab)
+      shift
+      cmd_shift_active_tab "$@"
+      ;;
+    __header_text)
+      shift
+      cmd_header_text "$@"
+      ;;
+    __picker_header)
+      shift
+      cmd_picker_header "$@"
+      ;;
+    __prompt_text)
+      shift
+      cmd_prompt_text "$@"
+      ;;
+    __picker_prompt)
+      shift
+      cmd_picker_prompt "$@"
+      ;;
+    __picker_preview)
+      shift
+      cmd_picker_preview "$@"
+      ;;
+    __picker_enter_tab_target)
+      shift
+      cmd_picker_enter_tab_target "$@"
+      ;;
+    __picker_leave_mode)
+      shift
+      cmd_picker_leave_mode "$@"
+      ;;
+    __picker_shift_active_tab)
+      shift
+      cmd_picker_shift_active_tab "$@"
+      ;;
+    __iterm_tab)
+      shift
+      open_command_in_iterm_tab "$*"
+      ;;
+    __iterm_window)
+      shift
+      open_command_in_iterm_window "$*"
+      ;;
+    __summon_tab)
+      shift
+      cmd_summon_tab "$@"
+      ;;
+    __import_iterm_tabs)
+      shift
+      cmd_import_iterm_tabs "$@"
+      ;;
+    __extract_current_iterm_window_snapshot)
+      shift
+      cmd_extract_current_iterm_window_snapshot "$@"
+      ;;
+    __preview)
+      shift
+      cmd_preview "$@"
+      ;;
+    "")
+      pick_ref_interactive "" action || return 0
+      ;;
+    *)
+      if [[ "$subcmd" == -* ]]; then
+        print_usage_stderr
+        return 1
+      fi
+      if [[ "$subcmd" == *:* ]]; then
+        cmd_resume "$@"
+      else
+        print -u2 -- "unknown subcommand: $subcmd"
+        print_usage_stderr
+        return 1
+      fi
+      ;;
+  esac
+}
+
+main "$@"
