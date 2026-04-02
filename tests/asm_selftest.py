@@ -228,6 +228,22 @@ class AsmTestCase(unittest.TestCase):
         self.assertIn("build a regression suite", text)
         self.assertIn("claude --dangerously-skip-permissions --resume 11111111-1111-4111-8111-111111111111", text)
 
+    def test_deep_handoff_preview_contains_deep_sections(self) -> None:
+        cp = self.run_asm(
+            "handoff",
+            "--to",
+            "codex",
+            "--mode",
+            "deep",
+            "--preview",
+            "claude:11111111-1111-4111-8111-111111111111",
+        )
+        text = cp.stdout
+        self.assertIn("## Current State", text)
+        self.assertIn("## Decisions Already Made", text)
+        self.assertIn("## Recent Transcript", text)
+        self.assertIn("## Suggested First Prompt", text)
+
     def test_active_tab_falls_back_to_all_when_missing(self) -> None:
         db_path = self.home / ".local" / "share" / "asm" / "meta.sqlite"
         self.run_asm("help")

@@ -74,16 +74,16 @@ shell_mode_label() {
 }
 
 file_mtime_epoch() {
-  local path="$1"
-  [[ -f "$path" ]] || return 1
-  stat -f '%m' "$path" 2>/dev/null
+  local file_path="$1"
+  [[ -f "$file_path" ]] || return 1
+  stat -f '%m' "$file_path" 2>/dev/null
 }
 
 cache_is_fresh() {
-  local path="$1"
+  local file_path="$1"
   local ttl="${2:-$ASM_CACHE_TTL_SECONDS}"
   local mtime
-  mtime="$(file_mtime_epoch "$path" 2>/dev/null)" || return 1
+  mtime="$(file_mtime_epoch "$file_path" 2>/dev/null)" || return 1
   (( ASM_NOW_EPOCH - mtime < ttl ))
 }
 
@@ -755,6 +755,7 @@ codex_first_user_message() {
 
 codex_recent_messages() {
   local session_id="$1"
+  local limit="${2:-12}"
   local session_file
   session_file="$(find_codex_session_file "$session_id")"
   [[ -n "$session_file" ]] || return 0
@@ -776,11 +777,12 @@ codex_recent_messages() {
         )
       ]
     | @tsv
-  ' "$session_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n 12
+  ' "$session_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n "$limit"
 }
 
 claude_recent_messages() {
   local session_id="$1"
+  local limit="${2:-12}"
   local session_file history_file
   session_file="$(find_claude_session_file "$session_id")"
   if [[ -n "$session_file" && -f "$session_file" ]]; then
@@ -811,19 +813,20 @@ claude_recent_messages() {
           )
         ]
       | @tsv
-    ' "$session_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n 12
+    ' "$session_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n "$limit"
     return 0
   fi
 
   history_file="$HOME/.claude/history.jsonl"
   [[ -f "$history_file" ]] || return 0
   rg -F "\"sessionId\":\"$session_id\"" "$history_file" 2>/dev/null \
-    | tail -n 12 \
+    | tail -n "$limit" \
     | jq -Rr 'fromjson? | "user\t" + (.display // "")'
 }
 
 opencode_recent_messages() {
   local session_id="$1"
+  local limit="${2:-12}"
   local db_file="$HOME/.local/share/opencode/opencode.db"
   [[ -f "$db_file" ]] || return 0
   local session_esc
@@ -834,7 +837,7 @@ opencode_recent_messages() {
     FROM message
     WHERE session_id = '${session_esc}'
     ORDER BY time_created DESC
-    LIMIT 12
+    LIMIT ${limit}
   " | jq -r '
     .[]
     | (.data | fromjson)
@@ -859,6 +862,7 @@ opencode_recent_messages() {
 
 gemini_recent_messages() {
   local source_file="$1"
+  local limit="${2:-12}"
   [[ -f "$source_file" ]] || return 0
   jq -r '
     .messages[]
@@ -875,11 +879,12 @@ gemini_recent_messages() {
         )
       ]
     | @tsv
-  ' "$source_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n 12
+  ' "$source_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n "$limit"
 }
 
 cursor_recent_messages() {
   local session_id="$1"
+  local limit="${2:-12}"
   local transcript_file
   transcript_file="$(find_cursor_transcript_file "$session_id")"
   [[ -n "$transcript_file" && -f "$transcript_file" ]] || return 0
@@ -900,7 +905,7 @@ cursor_recent_messages() {
         (.message.content | flatten | gsub("[\r\n]+"; " "))
       ]
     | @tsv
-  ' "$transcript_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n 12
+  ' "$transcript_file" | awk -F'\t' 'NF > 1 && length($2) > 0 { print }' | tail -n "$limit"
 }
 
 list_codex() {
@@ -1553,11 +1558,151 @@ clone_command_for_ref() {
   esac
 }
 
+transcript_path_for_ref() {
+  local ref="$1"
+  local agent="${ref%%:*}"
+  local session_id="${ref#*:}"
+  case "$agent" in
+    codex)
+      find_codex_session_file "$session_id"
+      ;;
+    claude)
+      find_claude_session_file "$session_id"
+      ;;
+    cursor-agent)
+      find_cursor_transcript_file "$session_id"
+      ;;
+    gemini)
+      find "$HOME/.gemini/tmp" -type f -name "session-*.json" -path "*/chats/*" 2>/dev/null \
+        | while IFS= read -r gemini_file; do
+            [[ -n "$gemini_file" ]] || continue
+            jq -e --arg sid "$session_id" '.sessionId == $sid or .id == $sid' "$gemini_file" >/dev/null 2>&1 && {
+              print -r -- "$gemini_file"
+              break
+            }
+          done
+      ;;
+    opencode)
+      print -r -- "$HOME/.local/share/opencode/opencode.db"
+      ;;
+  esac
+}
+
+recent_messages_for_ref() {
+  local ref="$1"
+  local turns="${2:-12}"
+  local agent="${ref%%:*}"
+  local session_id="${ref#*:}"
+  local source_file=""
+
+  if (( turns <= 0 )); then
+    return 0
+  fi
+
+  case "$agent" in
+    codex)
+      codex_recent_messages "$session_id" "$turns"
+      ;;
+    claude)
+      claude_recent_messages "$session_id" "$turns"
+      ;;
+    opencode)
+      opencode_recent_messages "$session_id" "$turns"
+      ;;
+    gemini)
+      source_file="$(transcript_path_for_ref "$ref")"
+      gemini_recent_messages "$source_file" "$turns"
+      ;;
+    cursor-agent)
+      cursor_recent_messages "$session_id" "$turns"
+      ;;
+  esac
+}
+
+format_recent_messages_markdown() {
+  local ref="$1"
+  local turns="${2:-12}"
+  local max_chars="${3:-12000}"
+  local lines out="" line role content remaining
+  lines="$(recent_messages_for_ref "$ref" "$turns")"
+  [[ -n "$lines" ]] || return 0
+  remaining="$max_chars"
+  while IFS=$'\t' read -r role content; do
+    [[ -n "$content" ]] || continue
+    line="[$role] $(clean_text "$content")"
+    if (( ${#line} > remaining )); then
+      out+="${line[1,$remaining]}"$'\n'
+      break
+    fi
+    out+="$line"$'\n'
+    (( remaining -= ${#line} + 1 ))
+    (( remaining > 0 )) || break
+  done <<<"$lines"
+  print -rn -- "${out%$'\n'}"
+}
+
+file_hints_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local turns="${3:-12}"
+  local cwd transcript hint_lines
+  cwd="$(resolve_cwd "${ref%%:*}" "${ref#*:}" "$(field_for_ref "$cache_file" "$ref" "cwd")")"
+  transcript="$(recent_messages_for_ref "$ref" "$turns")"
+  {
+    [[ -n "$cwd" ]] && print -r -- "$cwd"
+    while IFS=$'\t' read -r _role content; do
+      [[ -n "$content" ]] || continue
+      print -r -- "$content"
+    done <<<"$transcript"
+  } | rg -o '/[^[:space:]"'\'')]+(?:/[^[:space:]"'\'')]+)*' 2>/dev/null \
+    | awk '!seen[$0]++' \
+    | while IFS= read -r hint_path; do
+        [[ -n "$hint_path" ]] || continue
+        [[ "$hint_path" == /* ]] || continue
+        [[ -e "$hint_path" ]] || continue
+        print -r -- "$hint_path"
+      done | awk 'NR <= 8 { print }' || true
+}
+
+deep_state_blocks_for_ref() {
+  local ref="$1"
+  local turns="${2:-16}"
+  local transcript last_user last_assistant blocked decisions next_action
+  transcript="$(recent_messages_for_ref "$ref" "$turns")"
+  last_user="$(print -r -- "$transcript" | awk -F'\t' '$1=="user"{x=$2} END{print x}')"
+  last_assistant="$(print -r -- "$transcript" | awk -F'\t' '$1=="assistant"{x=$2} END{print x}')"
+  blocked="$(print -r -- "$transcript" | awk -F'\t' 'tolower($2) ~ /(blocked|error|fail|issue|problem|timeout|permission denied|not found)/ {print "- " $2}' | tail -n 3)"
+  decisions="$(print -r -- "$transcript" | awk -F'\t' '$1=="assistant"{print "- " $2}' | tail -n 4)"
+  next_action="${last_user:-Continue from the recent transcript and verify repo state first.}"
+
+  print -r -- "## Current State"
+  print -r -- "- What is done: ${last_assistant:-See recent transcript.}"
+  if [[ -n "$blocked" ]]; then
+    print -r -- "- What is blocked:"
+    print -r -- "$blocked"
+  else
+    print -r -- "- What is blocked: -"
+  fi
+  print -r -- "- What to do next: ${next_action}"
+  print
+  print -r -- "## Decisions Already Made"
+  if [[ -n "$decisions" ]]; then
+    print -r -- "$decisions"
+  else
+    print -r -- "- No explicit decisions were extracted automatically."
+  fi
+}
+
 build_handoff_markdown() {
   local cache_file="$1"
   local ref="$2"
   local target_agent="$3"
-  local agent session_id title alias_text cached_cwd cwd updated_display hint tags_text resume_cmd recent_excerpt last_opened_at
+  local handoff_mode="${4:-light}"
+  local turns="${5:-0}"
+  local max_chars="${6:-4000}"
+  local include_files="${7:-0}"
+  local include_transcript_path="${8:-0}"
+  local agent session_id title alias_text cached_cwd cwd updated_display hint tags_text resume_cmd recent_excerpt last_opened_at transcript_path recent_transcript file_hints
 
   agent="${ref%%:*}"
   session_id="${ref#*:}"
@@ -1570,6 +1715,12 @@ build_handoff_markdown() {
   tags_text="$(field_for_ref "$cache_file" "$ref" "tags_text")"
   resume_cmd="$(resume_command_for_ref "$cache_file" "$ref" 2>/dev/null || true)"
   recent_excerpt="$(recent_preview_text_for_ref "$cache_file" "$ref")"
+  transcript_path="$(transcript_path_for_ref "$ref")"
+  recent_transcript="$(format_recent_messages_markdown "$ref" "$turns" "$max_chars")"
+  file_hints=""
+  if [[ "$include_files" == "1" ]]; then
+    file_hints="$(file_hints_for_ref "$cache_file" "$ref" "$turns")"
+  fi
   hint=""
 
   if [[ "$agent" == "codex" ]]; then
@@ -1588,6 +1739,11 @@ build_handoff_markdown() {
 - Last opened in asm: ${last_opened_at:-"-"}
 - Tags: ${tags_text:-"-"}
 - Reopen source: ${resume_cmd:-"-"}
+EOF
+  if [[ "$include_transcript_path" == "1" ]]; then
+    print -r -- "- Transcript path: ${transcript_path:-"-"}"
+  fi
+  cat <<EOF
 
 ## Goal
 Continue the work from this session in the target agent.
@@ -1599,26 +1755,69 @@ Continue the work from this session in the target agent.
 ## Seed Context
 ${hint:-No seed message was extracted automatically. Open the source session if you need the full thread.}
 
-## Recent Transcript Excerpt
-${recent_excerpt:-No recent excerpt was extracted.}
 EOF
+  if [[ "$handoff_mode" == "deep" ]]; then
+    print
+    deep_state_blocks_for_ref "$ref" "$turns"
+    print
+    print -r -- "## Recent Transcript"
+    print -r -- "${recent_transcript:-No recent transcript was extracted.}"
+    if [[ "$include_files" == "1" ]]; then
+      print
+      print -r -- "## File Hints"
+      if [[ -n "$file_hints" ]]; then
+        while IFS= read -r hint_file; do
+          [[ -n "$hint_file" ]] || continue
+          print -r -- "- $hint_file"
+        done <<<"$file_hints"
+      else
+        print -r -- "- No file hints were extracted automatically."
+      fi
+    fi
+    print
+    print -r -- "## Suggested First Prompt"
+    print -r -- "Continue from this handoff. First verify the current repo state, then continue the latest unfinished work and preserve the decisions already captured above."
+  else
+    print
+    print -r -- "## Recent Transcript Excerpt"
+    print -r -- "${recent_excerpt:-No recent excerpt was extracted.}"
+  fi
 }
 
 export_bundle_for_ref() {
   local cache_file="$1"
   local ref="$2"
   local target_agent="${3:-portable}"
+  local handoff_mode="${4:-light}"
+  local turns="${5:-0}"
+  local max_chars="${6:-4000}"
+  local include_files="${7:-0}"
+  local include_transcript_path="${8:-0}"
   ensure_storage
 
   local ts out_file
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  out_file="$ASM_EXPORT_DIR/${ref//:/_}-to-${target_agent}-${ts}.md"
-  build_handoff_markdown "$cache_file" "$ref" "$target_agent" >"$out_file"
+  out_file="$ASM_EXPORT_DIR/${ref//:/_}-to-${target_agent}-${handoff_mode}-${ts}.md"
+  build_handoff_markdown "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "$include_files" "$include_transcript_path" >"$out_file"
   print -r -- "$out_file"
 }
 
 choose_handoff_target() {
   printf '%s\n' codex claude gemini | fzf --height=8 --layout=reverse --prompt='handoff> '
+}
+
+handoff_defaults() {
+  local mode="$1"
+  local turns="${2:-}"
+  local chars="${3:-}"
+  if [[ "$mode" == "deep" ]]; then
+    [[ -n "$turns" ]] || turns=16
+    [[ -n "$chars" ]] || chars=12000
+  else
+    [[ -n "$turns" ]] || turns=0
+    [[ -n "$chars" ]] || chars=4000
+  fi
+  print -r -- "$turns $chars"
 }
 
 normalize_snapshot_name() {
@@ -2800,9 +2999,14 @@ handoff_command_for_ref() {
   local cache_file="$1"
   local ref="$2"
   local target_agent="$3"
+  local handoff_mode="${4:-light}"
+  local turns="${5:-0}"
+  local max_chars="${6:-4000}"
+  local include_files="${7:-0}"
+  local include_transcript_path="${8:-0}"
   local bundle_file agent session_id cached_cwd cwd
 
-  bundle_file="$(export_bundle_for_ref "$cache_file" "$ref" "$target_agent")"
+  bundle_file="$(export_bundle_for_ref "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "$include_files" "$include_transcript_path")"
   agent="${ref%%:*}"
   session_id="${ref#*:}"
   cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
@@ -3199,9 +3403,16 @@ Commands:
   list
   resume <agent:session>
   clone <agent:session>
-  handoff [--to codex|claude|gemini] <agent:session>
+  handoff [--to codex|claude|gemini] [--mode light|deep] [--turns N] [--chars N]
+          [--preview|--print-bundle|--no-open] [--include-files] [--include-transcript-path]
+          <agent:session>
+  absorb [--to codex|claude|gemini] [--turns N] [--chars N]
+         [--preview|--print-bundle|--no-open] [--include-files] [--include-transcript-path]
+         <agent:session>
   revive <agent:session>
-  export <agent:session>
+  export [--to portable|codex|claude|gemini] [--mode light|deep] [--turns N] [--chars N]
+         [--preview|--print-bundle] [--include-files] [--include-transcript-path]
+         <agent:session>
   pin <agent:session>
   alias <agent:session> [name]
   iterm-save [name]
@@ -3218,6 +3429,10 @@ Keys in picker:
   ctrl-t             Toggle tags
   tab                Tab action menu
   ctrl-n             New tab from selection
+
+Handoff modes:
+  light              metadata + excerpt only
+  deep               light + recent turns, decisions, next action, file hints
 EOF
 }
 
@@ -3431,32 +3646,100 @@ cmd_clone() {
 }
 
 cmd_export() {
-  local ref cache_file out_file
+  local target_agent="portable" handoff_mode="light" turns="" max_chars="" preview=0 print_bundle=0 include_files="" include_transcript_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to) target_agent="${2:-}"; shift 2 ;;
+      --mode) handoff_mode="${2:-light}"; shift 2 ;;
+      --turns) turns="${2:-}"; shift 2 ;;
+      --chars) max_chars="${2:-}"; shift 2 ;;
+      --preview|--print-bundle) preview=1; print_bundle=1; shift ;;
+      --include-files) include_files=1; shift ;;
+      --include-transcript-path) include_transcript_path=1; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [[ "$handoff_mode" == "light" || "$handoff_mode" == "deep" ]] || {
+    print -u2 -- "invalid handoff mode: $handoff_mode"
+    return 1
+  }
+  local defaults ref cache_file out_file
+  defaults=("${(@s: :)$(handoff_defaults "$handoff_mode" "$turns" "$max_chars")}")
+  turns="${defaults[1]}"
+  max_chars="${defaults[2]}"
+  [[ -n "$include_files" ]] || [[ "$handoff_mode" != "deep" ]] || include_files=1
+  [[ -n "$include_transcript_path" ]] || [[ "$handoff_mode" != "deep" ]] || include_transcript_path=1
   ref="$(resolve_ref_argument "$@")" || return 1
   cache_file="$(mktemp)"
   build_cache >"$cache_file"
-  out_file="$(export_bundle_for_ref "$cache_file" "$ref" portable)"
+  if (( preview || print_bundle )); then
+    build_handoff_markdown "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "${include_files:-0}" "${include_transcript_path:-0}"
+    rm -f "$cache_file"
+    return 0
+  fi
+  out_file="$(export_bundle_for_ref "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "${include_files:-0}" "${include_transcript_path:-0}")"
   rm -f "$cache_file"
   copy_to_clipboard "$out_file"
   print -r -- "$out_file"
 }
 
 cmd_handoff() {
-  local target_agent=""
-  if [[ "${1:-}" == "--to" ]]; then
-    target_agent="${2:-}"
-    shift 2
-  fi
+  local target_agent="" handoff_mode="light" turns="" max_chars="" preview=0 print_bundle=0 no_open=0 include_files="" include_transcript_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to) target_agent="${2:-}"; shift 2 ;;
+      --mode) handoff_mode="${2:-light}"; shift 2 ;;
+      --turns) turns="${2:-}"; shift 2 ;;
+      --chars) max_chars="${2:-}"; shift 2 ;;
+      --preview) preview=1; no_open=1; shift ;;
+      --print-bundle) print_bundle=1; no_open=1; shift ;;
+      --no-open) no_open=1; shift ;;
+      --include-files) include_files=1; shift ;;
+      --include-transcript-path) include_transcript_path=1; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [[ "$handoff_mode" == "light" || "$handoff_mode" == "deep" ]] || {
+    print -u2 -- "invalid handoff mode: $handoff_mode"
+    return 1
+  }
   [[ -n "$target_agent" ]] || target_agent="$(choose_handoff_target)"
   [[ -n "$target_agent" ]] || return 1
 
-  local ref cache_file cmd
+  local defaults ref cache_file cmd out_file
+  defaults=("${(@s: :)$(handoff_defaults "$handoff_mode" "$turns" "$max_chars")}")
+  turns="${defaults[1]}"
+  max_chars="${defaults[2]}"
+  [[ -n "$include_files" ]] || [[ "$handoff_mode" != "deep" ]] || include_files=1
+  [[ -n "$include_transcript_path" ]] || [[ "$handoff_mode" != "deep" ]] || include_transcript_path=1
   ref="$(resolve_ref_argument "$@")" || return 1
   cache_file="$(mktemp)"
   build_cache >"$cache_file"
-  cmd="$(handoff_command_for_ref "$cache_file" "$ref" "$target_agent")"
+  if (( preview || print_bundle )); then
+    build_handoff_markdown "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "${include_files:-0}" "${include_transcript_path:-0}"
+    rm -f "$cache_file"
+    return 0
+  fi
+  if (( no_open )); then
+    out_file="$(export_bundle_for_ref "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "${include_files:-0}" "${include_transcript_path:-0}")"
+    rm -f "$cache_file"
+    copy_to_clipboard "$out_file"
+    print -r -- "$out_file"
+    return 0
+  fi
+  cmd="$(handoff_command_for_ref "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "${include_files:-0}" "${include_transcript_path:-0}")"
   rm -f "$cache_file"
   emit_shell_cmd "$cmd"
+}
+
+cmd_absorb() {
+  local args=("--mode" "deep")
+  if [[ $# -gt 0 ]]; then
+    args+=("$@")
+  fi
+  cmd_handoff "${args[@]}"
 }
 
 cmd_revive() {
@@ -3843,6 +4126,10 @@ main() {
     handoff)
       shift
       cmd_handoff "$@"
+      ;;
+    absorb)
+      shift
+      cmd_absorb "$@"
       ;;
     revive)
       shift
