@@ -40,6 +40,7 @@ class AsmTestCase(unittest.TestCase):
         self.env["PATH"] = f"{self.bin_dir}:{self.env.get('PATH','')}"
         self.env["ASM_MAX_SESSIONS"] = "20"
         self.env["ASM_CACHE_TTL_SECONDS"] = "0"
+        self.env["ASM_ITERM_SCAN_TIMEOUT"] = "2"
         self._seed_fake_bins()
         self._seed_claude_session()
         self._seed_codex_sessions()
