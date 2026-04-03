@@ -13,7 +13,10 @@ import unittest
 from pathlib import Path
 
 
-ASM_PATH = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).with_name("asm")
+DEFAULT_ASM_PATH = Path(__file__).resolve().parents[1] / "bin" / "asm"
+ASM_PATH = DEFAULT_ASM_PATH
+if len(sys.argv) > 1 and Path(sys.argv[1]).exists():
+    ASM_PATH = Path(sys.argv[1]).resolve()
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -53,8 +56,9 @@ class AsmTestCase(unittest.TestCase):
             exit 0
             """
         )
-        for name in ["claude", "codex", "opencode", "cursor-agent", "gemini", "fzf", "jq", "sqlite3", "osascript", "lsof", "pbcopy", "python3", "rg"]:
-            if name in {"fzf", "jq", "sqlite3", "osascript", "lsof", "pbcopy", "python3", "rg"}:
+        passthrough_bins = {"fzf", "jq", "sqlite3", "lsof", "pbcopy", "python3", "rg"}
+        for name in ["claude", "codex", "opencode", "cursor-agent", "gemini", "fzf", "jq", "sqlite3", "lsof", "pbcopy", "python3", "rg"]:
+            if name in passthrough_bins:
                 real = shutil.which(name)  # type: ignore[name-defined]
                 if real:
                     write_executable(
@@ -64,6 +68,113 @@ class AsmTestCase(unittest.TestCase):
                     continue
             log = self.logs_dir / f"{name}.log"
             write_executable(self.bin_dir / name, template.format(log=log))
+
+        real_uname = shutil.which("uname")
+        if not real_uname:
+            raise RuntimeError("uname is required for self-test")
+        write_executable(
+            self.bin_dir / "uname",
+            textwrap.dedent(
+                f"""\
+                #!/bin/sh
+                case "${{1:-}}" in
+                  -s)
+                    if [ -n "${{ASM_TEST_UNAME_S:-}}" ]; then
+                      printf '%s\\n' "$ASM_TEST_UNAME_S"
+                      exit 0
+                    fi
+                    ;;
+                  -m)
+                    if [ -n "${{ASM_TEST_UNAME_M:-}}" ]; then
+                      printf '%s\\n' "$ASM_TEST_UNAME_M"
+                      exit 0
+                    fi
+                    ;;
+                esac
+                exec {real_uname} "$@"
+                """
+            ),
+        )
+        write_executable(
+            self.bin_dir / "open",
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                if [ "${1:-}" = "-Ra" ] && { [ "${2:-}" = "iTerm" ] || [ "${2:-}" = "iTerm2" ]; }; then
+                  if [ "${ASM_TEST_OPEN_ITERM:-0}" = "1" ]; then
+                    exit 0
+                  fi
+                  exit 1
+                fi
+                exit 1
+                """
+            ),
+        )
+        write_executable(
+            self.bin_dir / "pgrep",
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                mode="${ASM_TEST_PGREP_MODE:-none}"
+                if [ "${1:-}" = "-x" ] && [ "${2:-}" = "iTerm2" ]; then
+                  case "$mode" in
+                    exact|both)
+                      exit 0
+                      ;;
+                  esac
+                  exit 1
+                fi
+                if [ "${1:-}" = "-f" ] && [ "${2:-}" = "/Contents/MacOS/iTerm2$" ]; then
+                  case "$mode" in
+                    path|both)
+                      exit 0
+                      ;;
+                  esac
+                  exit 1
+                fi
+                exit 1
+                """
+            ),
+        )
+        write_executable(
+            self.bin_dir / "osascript",
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                script=""
+                while [ "$#" -gt 0 ]; do
+                  if [ "$1" = "-e" ] && [ "$#" -ge 2 ]; then
+                    script="$2"
+                    shift 2
+                    continue
+                  fi
+                  shift
+                done
+
+                if printf '%s' "$script" | grep -Fq 'if application "iTerm2" is running then'; then
+                  printf '%s\\n' "${ASM_TEST_OSASCRIPT_RUNNING_RESULT:-no}"
+                  exit "${ASM_TEST_OSASCRIPT_RUNNING_EXIT:-0}"
+                fi
+
+                if printf '%s' "$script" | grep -Fq 'return (count of windows) as string'; then
+                  printf '%s\\n' "${ASM_TEST_OSASCRIPT_WINDOW_COUNT_RESULT:-0}"
+                  exit "${ASM_TEST_OSASCRIPT_WINDOW_COUNT_EXIT:-0}"
+                fi
+
+                if printf '%s' "$script" | grep -Fq 'return "ok"'; then
+                  if [ -n "${ASM_TEST_OSASCRIPT_OK_RESULT:-}" ]; then
+                    printf '%s\\n' "$ASM_TEST_OSASCRIPT_OK_RESULT"
+                  fi
+                  exit "${ASM_TEST_OSASCRIPT_OK_EXIT:-0}"
+                fi
+
+                if [ -n "${ASM_TEST_OSASCRIPT_DEFAULT_RESULT:-}" ]; then
+                  printf '%s\\n' "$ASM_TEST_OSASCRIPT_DEFAULT_RESULT"
+                fi
+                exit "${ASM_TEST_OSASCRIPT_DEFAULT_EXIT:-0}"
+                """
+            ),
+        )
 
     def _seed_claude_session(self) -> None:
         project_dir = self.home / ".claude" / "projects" / "-Users-test"
@@ -173,12 +284,20 @@ class AsmTestCase(unittest.TestCase):
                 + "\n"
             )
 
-    def run_asm(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_asm(
+        self,
+        *args: str,
+        check: bool = True,
+        env_overrides: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = self.env.copy()
+        if env_overrides:
+            env.update(env_overrides)
         return subprocess.run(
             [str(ASM_PATH), *args],
             text=True,
             capture_output=True,
-            env=self.env,
+            env=env,
             check=check,
         )
 
@@ -197,6 +316,50 @@ class AsmTestCase(unittest.TestCase):
         cp = self.run_asm("doctor")
         self.assertIn("shell integration: inactive", cp.stdout)
         self.assertIn("cache ttl:", cp.stdout)
+
+    def test_doctor_uses_iterm_process_path_fallback(self) -> None:
+        cp = self.run_asm(
+            "doctor",
+            env_overrides={
+                "ASM_TEST_UNAME_S": "Darwin",
+                "ASM_TEST_UNAME_M": "arm64",
+                "ASM_TEST_OPEN_ITERM": "1",
+                "ASM_TEST_PGREP_MODE": "path",
+            },
+        )
+        self.assertIn("iTerm2 installed: true", cp.stdout)
+        self.assertIn("iTerm2 running: true", cp.stdout)
+
+    def test_doctor_uses_osascript_running_fallback(self) -> None:
+        cp = self.run_asm(
+            "doctor",
+            env_overrides={
+                "ASM_TEST_UNAME_S": "Darwin",
+                "ASM_TEST_UNAME_M": "arm64",
+                "ASM_TEST_OPEN_ITERM": "1",
+                "ASM_TEST_PGREP_MODE": "none",
+                "ASM_TEST_OSASCRIPT_RUNNING_RESULT": "yes",
+                "ASM_TEST_OSASCRIPT_WINDOW_COUNT_RESULT": "2",
+                "ASM_TEST_OSASCRIPT_OK_RESULT": "ok",
+            },
+        )
+        self.assertIn("iTerm2 running: true", cp.stdout)
+        self.assertIn("iTerm2 windows: 2", cp.stdout)
+        self.assertIn("AppleScript to iTerm2: true", cp.stdout)
+
+    def test_doctor_reports_iterm_not_running_when_probes_fail(self) -> None:
+        cp = self.run_asm(
+            "doctor",
+            env_overrides={
+                "ASM_TEST_UNAME_S": "Darwin",
+                "ASM_TEST_UNAME_M": "arm64",
+                "ASM_TEST_OPEN_ITERM": "1",
+                "ASM_TEST_PGREP_MODE": "none",
+                "ASM_TEST_OSASCRIPT_RUNNING_RESULT": "no",
+            },
+        )
+        self.assertIn("iTerm2 installed: true", cp.stdout)
+        self.assertIn("iTerm2 running: false", cp.stdout)
 
     def test_list_prefers_recent_claude_over_old_opencode(self) -> None:
         cp = self.run_asm("list")

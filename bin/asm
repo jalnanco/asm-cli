@@ -129,7 +129,18 @@ iterm_installed() {
 }
 
 iterm_running() {
-  command_exists pgrep && pgrep -x iTerm2 >/dev/null 2>&1
+  if command_exists pgrep; then
+    pgrep -x iTerm2 >/dev/null 2>&1 && return 0
+    pgrep -f '/Contents/MacOS/iTerm2$' >/dev/null 2>&1 && return 0
+  fi
+
+  [[ "$(run_osascript_script "$ASM_ITERM_SCAN_TIMEOUT" <<'APPLESCRIPT' 2>/dev/null || true
+if application "iTerm2" is running then
+  return "yes"
+end if
+return "no"
+APPLESCRIPT
+)" == "yes" ]]
 }
 
 iterm_window_count() {

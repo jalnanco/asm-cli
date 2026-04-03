@@ -70,9 +70,11 @@ asm setup
 Run diagnostics:
 
 ```sh
+make test
 ./bin/asm doctor
-./bin/asm self-test
 ```
+
+`make test` runs the isolated self-test suite behind `./bin/asm self-test`. The regression harness stubs iTerm2 process detection and AppleScript responses, so it stays deterministic and does not require a live iTerm2 session.
 
 Basic usage:
 
@@ -81,6 +83,11 @@ Basic usage:
 ./bin/asm list
 ./bin/asm help
 ```
+
+Before publishing or opening a PR, the minimum validation bar should be:
+
+- `make test`
+- `./bin/asm doctor`
 
 ## Design Notes
 
