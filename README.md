@@ -86,9 +86,9 @@ Check your environment with:
 ### Install From GitHub Releases
 
 ```sh
-curl -L https://github.com/jalnanco/asm-cli/releases/latest/download/asm-cli-0.1.0.tar.gz -o asm-cli.tar.gz
+curl -L https://github.com/jalnanco/asm-cli/releases/latest/download/asm-cli-0.1.1.tar.gz -o asm-cli.tar.gz
 tar -xzf asm-cli.tar.gz
-cd asm-cli-0.1.0
+cd asm-cli-0.1.1
 ./install.sh
 ```
 
