@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 .venv/
+bin/.asm_source_tmp
+dist/

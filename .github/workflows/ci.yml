@@ -17,5 +17,17 @@ jobs:
       - name: Install CLI dependencies
         run: brew install fzf jq ripgrep
 
+      - name: Validate shell and Python syntax
+        run: |
+          zsh -n bin/asm
+          bash -n scripts/install.sh scripts/build-release.sh
+          python3 -m py_compile bin/asm_runtime.py bin/asm_store.py bin/asm_inspect.py tests/asm_selftest.py
+
+      - name: Run smoke-test
+        run: make smoke
+
       - name: Run self-test
         run: make test
+
+      - name: Build release bundle
+        run: make package

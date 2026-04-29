@@ -11,20 +11,48 @@ ASM_EXPORT_DIR="$ASM_HOME/exports"
 ASM_ITERM_LAYOUT_DIR="$ASM_HOME/iterm-layouts"
 ASM_ITERM_SCAN_TIMEOUT="${ASM_ITERM_SCAN_TIMEOUT:-0.35}"
 ASM_ITERM_RESTORE_DELAY="${ASM_ITERM_RESTORE_DELAY:-0.1}"
+ASM_AUTOSAVE_INTERVAL="${ASM_AUTOSAVE_INTERVAL:-3600}"
+ASM_AUTOSAVE_MAX="${ASM_AUTOSAVE_MAX:-24}"
+ASM_AUTOSAVE_STAMP="$ASM_HOME/iterm-layouts/.autosave-stamp"
+ASM_AUTOSAVE_LOCK_DIR="$ASM_HOME/iterm-layouts/.autosave.lock"
+ASM_AUTOSAVE_SCAN_TIMEOUT="${ASM_AUTOSAVE_SCAN_TIMEOUT:-2}"
+ASM_AUTOSAVE_LOCK_STALE_SECONDS="${ASM_AUTOSAVE_LOCK_STALE_SECONDS:-30}"
+ASM_QMD_DOC_DIR="$ASM_HOME/qmd-docs"
+ASM_QMD_INDEX_NAME="${ASM_QMD_INDEX_NAME:-asm_sessions_v1}"
+ASM_QMD_COLLECTION_NAME="${ASM_QMD_COLLECTION_NAME:-asm_sessions_v1}"
+ASM_QMD_SYNC_STAMP="$ASM_HOME/qmd-sync.sha256"
 ASM_NOW_EPOCH="${EPOCHSECONDS:-$(date +%s)}"
-ASM_MAX_SESSIONS="${ASM_MAX_SESSIONS:-100}"
+ASM_MAX_SESSIONS="${ASM_MAX_SESSIONS:-500}"
 ASM_CACHE_TTL_SECONDS="${ASM_CACHE_TTL_SECONDS:-15}"
 ASM_SESSION_CACHE_FILE="$ASM_HOME/session-cache.json"
+ASM_LAST_LIST_FILE="$ASM_HOME/last-list-refs.txt"
+ASM_JIRA_LAST_FILE="$ASM_HOME/jira-last.json"
+ASM_JIRA_CONFIG_FILE="$ASM_HOME/jira-config.json"
 ASM_CODEX_FILE_CACHE="$ASM_HOME/codex-file-cache.json"
 ASM_CLAUDE_PROJECT_CACHE="$ASM_HOME/claude-project-cache.json"
 ASM_SCRIPT_PATH="${(%):-%x}"
 [[ -n "$ASM_SCRIPT_PATH" ]] || ASM_SCRIPT_PATH="$0"
 ASM_SCRIPT_PATH="${ASM_SCRIPT_PATH:A}"
-ASM_RUNTIME_PY="${ASM_SCRIPT_PATH:h}/asm_runtime.py"
-ASM_SELFTEST_PY="${ASM_SCRIPT_PATH:h}/asm_selftest.py"
+ASM_LIBEXEC_DIR="${ASM_LIBEXEC_DIR:-${ASM_SCRIPT_PATH:h}}"
+[[ -d "$ASM_LIBEXEC_DIR" ]] || ASM_LIBEXEC_DIR="${ASM_SCRIPT_PATH:h}"
+ASM_RUNTIME_PY="$ASM_LIBEXEC_DIR/asm_runtime.py"
+ASM_STORE_PY="$ASM_LIBEXEC_DIR/asm_store.py"
+ASM_SELFTEST_PY="$ASM_LIBEXEC_DIR/asm_selftest.py"
 if [[ ! -f "$ASM_SELFTEST_PY" && -f "${ASM_SCRIPT_PATH:h:h}/tests/asm_selftest.py" ]]; then
   ASM_SELFTEST_PY="${ASM_SCRIPT_PATH:h:h}/tests/asm_selftest.py"
 fi
+ASM_INSPECT_PY="$ASM_LIBEXEC_DIR/asm_inspect.py"
+ASM_VERSION_FILE="${ASM_VERSION_FILE:-}"
+if [[ -z "$ASM_VERSION_FILE" ]]; then
+  if [[ -f "$ASM_LIBEXEC_DIR/VERSION" ]]; then
+    ASM_VERSION_FILE="$ASM_LIBEXEC_DIR/VERSION"
+  elif [[ -f "${ASM_SCRIPT_PATH:h:h}/VERSION" ]]; then
+    ASM_VERSION_FILE="${ASM_SCRIPT_PATH:h:h}/VERSION"
+  else
+    ASM_VERSION_FILE=""
+  fi
+fi
+ASM_LAST_HANDOFF_TARGET_FILE="$ASM_HOME/last-handoff-target"
 
 debug_log() {
   [[ -n "${ASM_DEBUG:-}" ]] || return 0
@@ -36,6 +64,10 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+qmd_available() {
+  command_exists qmd
+}
+
 color_enabled() {
   [[ -n "${ASM_FORCE_COLOR:-}" ]] && return 0
   [[ -n "${NO_COLOR:-}" ]] && return 1
@@ -44,12 +76,29 @@ color_enabled() {
   [[ "${TERM:-}" != "dumb" ]]
 }
 
+read_version() {
+  if [[ -n "$ASM_VERSION_FILE" && -f "$ASM_VERSION_FILE" ]]; then
+    head -n 1 "$ASM_VERSION_FILE"
+    return 0
+  fi
+
+  print -r -- "0.0.0-dev"
+}
+
 runtime_helper_exists() {
   [[ -f "$ASM_RUNTIME_PY" ]]
 }
 
+store_helper_exists() {
+  [[ -f "$ASM_STORE_PY" ]]
+}
+
 selftest_helper_exists() {
   [[ -f "$ASM_SELFTEST_PY" ]]
+}
+
+inspect_helper_exists() {
+  [[ -f "$ASM_INSPECT_PY" ]]
 }
 
 run_runtime_py() {
@@ -59,6 +108,15 @@ run_runtime_py() {
     return 1
   fi
   python3 "$ASM_RUNTIME_PY" "$@"
+}
+
+run_store_py() {
+  if ! store_helper_exists; then
+    print -u2 -- "store helper not found: $ASM_STORE_PY"
+    print -u2 -- "asm requires asm_store.py next to the main script for metadata storage features."
+    return 1
+  fi
+  python3 "$ASM_STORE_PY" "$@"
 }
 
 shell_integration_active() {
@@ -75,7 +133,7 @@ shell_mode_label() {
 
 file_mtime_epoch() {
   local file_path="$1"
-  [[ -f "$file_path" ]] || return 1
+  [[ -e "$file_path" ]] || return 1
   stat -f '%m' "$file_path" 2>/dev/null
 }
 
@@ -176,41 +234,8 @@ ensure_iterm_automation_ready() {
 }
 
 ensure_storage() {
-  mkdir -p "$ASM_HOME" "$ASM_EXPORT_DIR" "$ASM_ITERM_LAYOUT_DIR"
-  sqlite3_cmd "$ASM_DB" <<'SQL' >/dev/null
-CREATE TABLE IF NOT EXISTS session_meta (
-  agent TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  pinned INTEGER NOT NULL DEFAULT 0,
-  alias TEXT NOT NULL DEFAULT '',
-  last_opened_at TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (agent, session_id)
-);
-CREATE TABLE IF NOT EXISTS tabs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL UNIQUE,
-  sort_order INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS tab_sessions (
-  agent TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  tab_id INTEGER NOT NULL,
-  PRIMARY KEY (agent, session_id),
-  FOREIGN KEY (tab_id) REFERENCES tabs(id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS session_tags (
-  agent TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  tag TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (agent, session_id, tag)
-);
-CREATE TABLE IF NOT EXISTS app_state (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-SQL
+  mkdir -p "$ASM_HOME" "$ASM_EXPORT_DIR" "$ASM_ITERM_LAYOUT_DIR" "$ASM_QMD_DOC_DIR"
+  run_store_py ensure-schema "$ASM_DB" >/dev/null
 }
 
 shell_quote() {
@@ -320,51 +345,34 @@ project_label() {
 
 list_tab_names() {
   print -r -- "All"
-  sqlite3_cmd "$ASM_DB" "SELECT name FROM tabs ORDER BY sort_order ASC, name ASC;" 2>/dev/null || true
+  run_store_py list-tabs "$ASM_DB" 2>/dev/null || true
 }
 
 get_active_tab_name() {
-  local active
-  active="$(sqlite3_cmd "$ASM_DB" "SELECT value FROM app_state WHERE key = 'active_tab';" 2>/dev/null || true)"
-  if [[ -n "$active" && "$active" == "All" ]]; then
-    print -r -- "$active"
-  elif [[ -n "$active" ]]; then
-    local exists
-    exists="$(sqlite3_cmd "$ASM_DB" "SELECT COUNT(*) FROM tabs WHERE name = '$(sql_escape "$active")';" 2>/dev/null || print 0)"
-    if [[ "$exists" != "0" ]]; then
-      print -r -- "$active"
+  run_store_py get-active-tab "$ASM_DB" 2>/dev/null || print -r -- "All"
+}
+
+resolved_active_tab_name() {
+  local active_tab="${1:-$(get_active_tab_name)}"
+  local tab
+  while IFS= read -r tab; do
+    [[ -n "$tab" ]] || continue
+    if [[ "$tab" == "$active_tab" ]]; then
+      print -r -- "$active_tab"
       return 0
     fi
-    print -r -- "All"
-  else
-    print -r -- "All"
-  fi
+  done < <(list_tab_names)
+  print -r -- "All"
 }
 
 set_active_tab_name() {
   local tab_name="$1"
-  local esc
-  esc="$(sql_escape "$tab_name")"
-  sqlite3_cmd "$ASM_DB" "
-    INSERT INTO app_state (key, value)
-    VALUES ('active_tab', '${esc}')
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  " >/dev/null
+  run_store_py set-active-tab "$ASM_DB" "$tab_name" >/dev/null
 }
 
 create_tab() {
   local tab_name="$1"
-  local esc
-  esc="$(sql_escape "$tab_name")"
-  sqlite3_cmd "$ASM_DB" "
-    INSERT INTO tabs (name, sort_order, created_at)
-    VALUES (
-      '${esc}',
-      COALESCE((SELECT MAX(sort_order) + 1 FROM tabs), 1),
-      strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-    )
-    ON CONFLICT(name) DO NOTHING
-  " >/dev/null
+  run_store_py create-tab "$ASM_DB" "$tab_name" >/dev/null
 }
 
 choose_tab_name() {
@@ -401,8 +409,12 @@ picker_state_write() {
   local state_file="$1"
   local mode="$2"
   shift 2
+  local preview_mode
+  preview_mode="$(picker_state_preview_mode "$state_file")"
+  [[ -n "${ASM_PICKER_PREVIEW_MODE_OVERRIDE:-}" ]] && preview_mode="$ASM_PICKER_PREVIEW_MODE_OVERRIDE"
   {
     print -r -- "$mode"
+    print -r -- "preview:${preview_mode}"
     local ref
     for ref in "$@"; do
       [[ -n "$ref" ]] || continue
@@ -420,10 +432,54 @@ picker_state_mode() {
   head -n 1 "$state_file" 2>/dev/null | tr -d '\r'
 }
 
+normalize_picker_preview_mode() {
+  case "${1:-overview}" in
+    overview|transcript|commands) print -r -- "$1" ;;
+    *) print -r -- "overview" ;;
+  esac
+}
+
+picker_state_preview_mode() {
+  local state_file="$1"
+  [[ -f "$state_file" ]] || {
+    print -r -- "overview"
+    return 0
+  }
+  local line
+  line="$(sed -n '2p' "$state_file" 2>/dev/null | tr -d '\r')"
+  if [[ "$line" == preview:* ]]; then
+    normalize_picker_preview_mode "${line#preview:}"
+  else
+    print -r -- "overview"
+  fi
+}
+
 picker_state_refs() {
   local state_file="$1"
   [[ -f "$state_file" ]] || return 0
-  tail -n +2 "$state_file" 2>/dev/null
+  local second_line
+  second_line="$(sed -n '2p' "$state_file" 2>/dev/null | tr -d '\r')"
+  if [[ "$second_line" == preview:* ]]; then
+    tail -n +3 "$state_file" 2>/dev/null
+  else
+    tail -n +2 "$state_file" 2>/dev/null
+  fi
+}
+
+picker_state_primary_ref() {
+  local state_file="$1"
+  picker_state_refs "$state_file" | head -n 1
+}
+
+picker_state_set_preview_mode() {
+  local state_file="$1"
+  local preview_mode
+  preview_mode="$(normalize_picker_preview_mode "${2:-overview}")"
+  local mode
+  mode="$(picker_state_mode "$state_file")"
+  local refs=()
+  refs=("${(@f)$(picker_state_refs "$state_file")}")
+  ASM_PICKER_PREVIEW_MODE_OVERRIDE="$preview_mode" picker_state_write "$state_file" "$mode" "${refs[@]}"
 }
 
 picker_tab_target_rows() {
@@ -437,6 +493,23 @@ picker_tab_target_rows() {
   done < <(list_tab_names)
 }
 
+picker_revive_rows() {
+  local cache_file="$1"
+  local ref="$2"
+  local agent
+  agent="${ref%%:*}"
+  printf '%s\t%s\t%s\n' '__revive__:handoff' 'handoff' 'Handoff other-agent'
+  if clone_command_for_ref "$cache_file" "$ref" >/dev/null 2>&1; then
+    printf '%s\t%s\t%s\n' '__revive__:clone' 'clone' "Clone same-agent (${agent})"
+  fi
+  printf '%s\t%s\t%s\n' '__revive__:export' 'export' 'Export portable bundle'
+  printf '%s\t%s\t%s\n' '__revive__:tab' 'tab' 'Resume in new iTerm tab'
+  printf '%s\t%s\t%s\n' '__revive__:window' 'window' 'Resume in new iTerm window'
+  printf '%s\t%s\t%s\n' '__revive__:cd' 'cd' 'Cd to session cwd'
+  printf '%s\t%s\t%s\n' '__revive__:copy' 'copy' 'Copy session ref'
+  printf '%s\t%s\t%s\n' '__revive__:back' 'back' 'Back to sessions'
+}
+
 prompt_tab_name() {
   print -n -- "Tab name: " >/dev/tty
   local name
@@ -447,38 +520,12 @@ prompt_tab_name() {
 assign_ref_to_tab() {
   local ref="$1"
   local tab_name="$2"
-  local agent="${ref%%:*}"
-  local session_id="${ref#*:}"
-  local tab_esc agent_esc id_esc
-  tab_esc="$(sql_escape "$tab_name")"
-  agent_esc="$(sql_escape "$agent")"
-  id_esc="$(sql_escape "$session_id")"
-
-  create_tab "$tab_name"
-
-  sqlite3_cmd "$ASM_DB" "
-    INSERT INTO tab_sessions (agent, session_id, tab_id)
-    VALUES (
-      '${agent_esc}',
-      '${id_esc}',
-      (SELECT id FROM tabs WHERE name = '${tab_esc}')
-    )
-    ON CONFLICT(agent, session_id) DO UPDATE SET
-      tab_id = excluded.tab_id
-  " >/dev/null
+  run_store_py assign-ref-to-tab "$ASM_DB" "$ref" "$tab_name" >/dev/null
 }
 
 remove_ref_from_tab() {
   local ref="$1"
-  local agent="${ref%%:*}"
-  local session_id="${ref#*:}"
-  local agent_esc id_esc
-  agent_esc="$(sql_escape "$agent")"
-  id_esc="$(sql_escape "$session_id")"
-  sqlite3_cmd "$ASM_DB" "
-    DELETE FROM tab_sessions
-    WHERE agent = '${agent_esc}' AND session_id = '${id_esc}'
-  " >/dev/null
+  run_store_py remove-ref-from-tab "$ASM_DB" "$ref" >/dev/null
 }
 
 tab_count_from_cache() {
@@ -493,47 +540,73 @@ tab_count_from_cache() {
 }
 
 build_tab_header() {
-  local active_tab="$1"
+  local active_tab
+  active_tab="$(resolved_active_tab_name "$1")"
   local cache_file="${2:-${ASM_CACHE_FILE:-$ASM_SESSION_CACHE_FILE}}"
-  local out="" tab count label styled
+  local out="" tab count label
   while IFS= read -r tab; do
     [[ -n "$tab" ]] || continue
     if [[ -f "$cache_file" ]]; then
       count="$(tab_count_from_cache "$cache_file" "$tab" 2>/dev/null || print 0)"
-    elif [[ "$tab" == "All" ]]; then
-      count="$(sqlite3_cmd "$ASM_DB" "SELECT COUNT(*) FROM session_meta;" 2>/dev/null || print 0)"
     else
-      count="$(sqlite3_cmd "$ASM_DB" "
-        SELECT COUNT(*)
-        FROM tab_sessions ts
-        JOIN tabs t ON t.id = ts.tab_id
-        WHERE t.name = '$(sql_escape "$tab")'
-      " 2>/dev/null || print 0)"
+      count="$(run_store_py tab-count "$ASM_DB" "$tab" 2>/dev/null || print 0)"
     fi
     if [[ "$tab" == "$active_tab" ]]; then
-      label="${tab}:${count}"
+      label="[$tab:$count]"
     else
-      label="${tab}"
-    fi
-    if [[ "$tab" == "$active_tab" ]]; then
-      styled="$(colorize_text '1;38;5;16;48;5;81' " $label ")"
-    else
-      styled="$(colorize_text '38;5;246' " $label ")"
+      label="$tab:$count"
     fi
     if [[ -n "$out" ]]; then
-      out+="$(colorize_text '38;5;240' ' | ')"
+      out+=" | "
     fi
-    out+="$styled"
+    out+="$label"
   done < <(list_tab_names)
-  print -r -- "$out"
+  print -r -- "Tabs: $out"
+}
+
+picker_status_line() {
+  local active_tab
+  active_tab="$(resolved_active_tab_name "$1")"
+  local cache_file="${2:-${ASM_CACHE_FILE:-$ASM_SESSION_CACHE_FILE}}"
+  local state_file="${3:-}"
+  local total visible pinned search_hint preview_mode
+  if [[ -f "$cache_file" ]]; then
+    total="$(jq -r 'length' "$cache_file" 2>/dev/null || print 0)"
+    if [[ "$active_tab" == "All" ]]; then
+      visible="$total"
+      pinned="$(jq -r '[ .[] | select((.pinned // 0) == 1) ] | length' "$cache_file" 2>/dev/null || print 0)"
+    else
+      visible="$(tab_count_from_cache "$cache_file" "$active_tab" 2>/dev/null || print 0)"
+      pinned="$(
+        jq -r --arg active_tab "$active_tab" '
+          [ .[] | select((.tab_name // "") == $active_tab and (.pinned // 0) == 1) ] | length
+        ' "$cache_file" 2>/dev/null || print 0
+      )"
+    fi
+  else
+    total=0
+    visible=0
+    pinned=0
+  fi
+  search_hint="${ASM_PICKER_QUERY_HINT:-live filter}"
+  preview_mode="$(picker_state_preview_mode "$state_file")"
+  printf 'State: tab=%s  |  visible=%s/%s  |  pinned=%s  |  preview=%s  |  search=%s' \
+    "$active_tab" "$visible" "$total" "$pinned" "$preview_mode" "$search_hint"
+}
+
+picker_shortcuts_strip() {
+  print -r -- "Keys: enter resume | v menu | h choose | l last | m move | n new-tab | u untab"
 }
 
 picker_header_text() {
-  local active_tab="${1:-All}"
+  local active_tab
+  active_tab="$(resolved_active_tab_name "$1")"
   local cache_file="${2:-${ASM_CACHE_FILE:-$ASM_SESSION_CACHE_FILE}}"
-  local tab_header
-  tab_header="$(build_tab_header "$active_tab" "$cache_file")"
-  printf '%s' "TABS: $tab_header"
+  local state_file="${3:-}"
+  build_tab_header "$active_tab" "$cache_file"
+  picker_status_line "$active_tab" "$cache_file" "$state_file"
+  print
+  picker_shortcuts_strip
 }
 
 tag_ref_interactive() {
@@ -621,44 +694,16 @@ shift_tab_name() {
 toggle_ref_tag() {
   local ref="$1"
   local tag="$2"
-  local agent="${ref%%:*}"
-  local session_id="${ref#*:}"
-  local agent_esc id_esc tag_esc
-  agent_esc="$(sql_escape "$agent")"
-  id_esc="$(sql_escape "$session_id")"
-  tag_esc="$(sql_escape "$tag")"
-
-  sqlite3_cmd "$ASM_DB" "
-    DELETE FROM session_tags
-    WHERE agent='${agent_esc}' AND session_id='${id_esc}' AND tag='${tag_esc}';
-    INSERT INTO session_tags (agent, session_id, tag, created_at)
-    SELECT '${agent_esc}', '${id_esc}', '${tag_esc}', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-    WHERE changes() = 0;
-  " >/dev/null
+  run_store_py toggle-tag "$ASM_DB" "$ref" "$tag" >/dev/null
 }
 
 list_ref_tags() {
   local ref="$1"
-  local agent="${ref%%:*}"
-  local session_id="${ref#*:}"
-  local agent_esc id_esc
-  agent_esc="$(sql_escape "$agent")"
-  id_esc="$(sql_escape "$session_id")"
-  sqlite3_cmd "$ASM_DB" "
-    SELECT tag
-    FROM session_tags
-    WHERE agent='${agent_esc}' AND session_id='${id_esc}'
-    ORDER BY tag ASC
-  " 2>/dev/null || true
+  run_store_py list-ref-tags "$ASM_DB" "$ref" 2>/dev/null || true
 }
 
 list_all_tags() {
-  sqlite3_cmd "$ASM_DB" "
-    SELECT tag
-    FROM session_tags
-    GROUP BY tag
-    ORDER BY COUNT(*) DESC, tag ASC
-  " 2>/dev/null || true
+  run_store_py list-all-tags "$ASM_DB" 2>/dev/null || true
 }
 
 prompt_tag_name() {
@@ -671,20 +716,33 @@ prompt_tag_name() {
 
 copy_to_clipboard() {
   if command -v pbcopy >/dev/null 2>&1; then
-    printf '%s' "$1" | pbcopy
+    printf '%s' "$1" | pbcopy || true
   fi
 }
 
 notice() {
   if [[ -t 1 ]]; then
-    print -r -- "$1" >/dev/tty
+    print -r -- "$1" >/dev/tty 2>/dev/null || print -u2 -- "$1" 2>/dev/null || true
   fi
+}
+
+command_requires_terminal() {
+  local cmd="$1"
+  [[ "$cmd" == cd\ *'&& codex '* ]] && return 0
+  [[ "$cmd" == cd\ *'&& claude '* ]] && return 0
+  [[ "$cmd" == cd\ *'&& opencode '* ]] && return 0
+  [[ "$cmd" == cd\ *'&& cursor-agent '* ]] && return 0
+  [[ "$cmd" == cd\ *'&& gemini '* ]] && return 0
+  return 1
 }
 
 emit_shell_cmd() {
   local cmd="$1"
   if [[ -n "${ASM_CMD_FILE:-}" ]]; then
     print -r -- "$cmd" >"$ASM_CMD_FILE"
+  elif command_requires_terminal "$cmd" && [[ ! -t 0 || ! -t 1 ]]; then
+    print -u2 -- "interactive command requires a terminal; printing exact command instead"
+    print -r -- "$cmd"
   elif [[ "$cmd" == cd\ *'&& '* || "$cmd" == command\ asm\ __* ]]; then
     notice "shell integration inactive; running action in child shell"
     eval "$cmd"
@@ -920,74 +978,7 @@ cursor_recent_messages() {
 }
 
 list_codex() {
-  python3 - <<'PY' "$HOME" "$ASM_MAX_SESSIONS" "$ASM_CODEX_FILE_CACHE"
-from pathlib import Path
-import json
-import os
-import re
-import sys
-import time
-
-home = Path(sys.argv[1])
-limit = int(sys.argv[2])
-cache_path = Path(sys.argv[3])
-index_file = home / ".codex" / "session_index.jsonl"
-sessions_root = home / ".codex" / "sessions"
-
-if not index_file.exists():
-    raise SystemExit(0)
-
-def build_index():
-    mapping = {}
-    if sessions_root.exists():
-        for path in sessions_root.rglob("*.jsonl"):
-            m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", path.name)
-            if m:
-                mapping[m.group(1)] = str(path)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps({"created_at": int(time.time()), "index": mapping}), encoding="utf-8")
-    return mapping
-
-try:
-    if cache_path.exists():
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        if int(time.time()) - int(payload.get("created_at", 0)) < 300:
-            file_index = payload.get("index", {})
-        else:
-            file_index = build_index()
-    else:
-        file_index = build_index()
-except Exception:
-    file_index = build_index()
-
-count = 0
-with index_file.open(encoding="utf-8") as fh:
-    for line in fh:
-        try:
-            row = json.loads(line)
-        except Exception:
-            continue
-        session_id = row.get("id")
-        updated_at = row.get("updated_at")
-        if not session_id or not updated_at:
-            continue
-        if session_id not in file_index:
-            continue
-        updated_epoch = int(
-            __import__("datetime").datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
-        )
-        print(json.dumps({
-            "agent": "codex",
-            "id": session_id,
-            "title": row.get("thread_name", ""),
-            "cwd": "",
-            "updated_epoch": updated_epoch,
-            "updated_display": updated_at,
-        }, ensure_ascii=False))
-        count += 1
-        if count >= limit:
-            break
-PY
+  run_runtime_py list-codex "$HOME" "$ASM_MAX_SESSIONS" "$ASM_CODEX_FILE_CACHE"
 }
 
 list_claude() {
@@ -1103,26 +1094,38 @@ build_cache() {
     return 0
   fi
 
-  local sessions_tmp meta_tmp tabs_tmp tags_tmp
+  local sessions_tmp meta_tmp tabs_tmp tags_tmp relations_tmp active_scan_tmp
   sessions_tmp="$(mktemp)"
   meta_tmp="$(mktemp)"
   tabs_tmp="$(mktemp)"
   tags_tmp="$(mktemp)"
+  relations_tmp="$(mktemp)"
+  active_scan_tmp="$(mktemp)"
 
   collect_session_records >"$sessions_tmp"
   export_session_meta_json >"$meta_tmp"
   export_tab_assignments_json >"$tabs_tmp"
   export_session_tags_json >"$tags_tmp"
+  export_session_relations_json >"$relations_tmp"
+  if ! capture_iterm_tty_scan >"$active_scan_tmp" 2>/dev/null; then
+    : >"$active_scan_tmp"
+  fi
 
-  local output_tmp
+  local output_tmp enrich_tmp
   output_tmp="$(mktemp)"
+  enrich_tmp="$(mktemp)"
 
-  merge_cache_payload "$sessions_tmp" "$meta_tmp" "$tabs_tmp" "$tags_tmp" >"$output_tmp"
+  merge_cache_payload "$sessions_tmp" "$meta_tmp" "$tabs_tmp" "$tags_tmp" "$relations_tmp" >"$output_tmp"
+  if run_runtime_py enrich-cache "$output_tmp" "$active_scan_tmp" >"$enrich_tmp" 2>/dev/null; then
+    mv "$enrich_tmp" "$output_tmp"
+  else
+    rm -f "$enrich_tmp"
+  fi
 
   cp "$output_tmp" "$ASM_SESSION_CACHE_FILE" 2>/dev/null || true
   cat "$output_tmp"
 
-  rm -f "$sessions_tmp" "$meta_tmp" "$tabs_tmp" "$tags_tmp" "$output_tmp"
+  rm -f "$sessions_tmp" "$meta_tmp" "$tabs_tmp" "$tags_tmp" "$relations_tmp" "$active_scan_tmp" "$enrich_tmp" "$output_tmp"
 }
 
 collect_session_records() {
@@ -1136,37 +1139,19 @@ collect_session_records() {
 }
 
 export_session_meta_json() {
-  sqlite3_cmd -json "$ASM_DB" "
-    SELECT
-      agent,
-      session_id,
-      pinned,
-      COALESCE(alias, '') AS alias,
-      COALESCE(last_opened_at, '') AS last_opened_at
-    FROM session_meta
-  "
+  run_store_py export-session-meta "$ASM_DB"
 }
 
 export_tab_assignments_json() {
-  sqlite3_cmd -json "$ASM_DB" "
-    SELECT
-      ts.agent,
-      ts.session_id,
-      t.name AS tab_name
-    FROM tab_sessions ts
-    JOIN tabs t ON t.id = ts.tab_id
-  "
+  run_store_py export-tab-assignments "$ASM_DB"
 }
 
 export_session_tags_json() {
-  sqlite3_cmd -json "$ASM_DB" "
-    SELECT
-      agent,
-      session_id,
-      tag
-    FROM session_tags
-    ORDER BY agent ASC, session_id ASC, tag ASC
-  "
+  run_store_py export-session-tags "$ASM_DB"
+}
+
+export_session_relations_json() {
+  run_store_py export-session-relations "$ASM_DB"
 }
 
 merge_cache_payload() {
@@ -1174,11 +1159,13 @@ merge_cache_payload() {
   local meta_json="$2"
   local tabs_json="$3"
   local tags_json="$4"
+  local relations_json="$5"
   jq -n \
     --slurpfile sessions "$sessions_json" \
     --slurpfile meta "$meta_json" \
     --slurpfile tabs "$tabs_json" \
-    --slurpfile tags "$tags_json" '
+    --slurpfile tags "$tags_json" \
+    --slurpfile relations "$relations_json" '
       ($meta[0] // [] | map({key: (.agent + ":" + .session_id), value: .}) | from_entries) as $mx
       | ($tabs[0] // [] | map({key: (.agent + ":" + .session_id), value: .}) | from_entries) as $tx
       | (
@@ -1193,6 +1180,31 @@ merge_cache_payload() {
             })
           | from_entries
         ) as $gx
+      | (
+          $relations[0] // []
+          | map({
+              key: (.child_agent + ":" + .child_session_id),
+              value: {
+                parent_ref: (.parent_agent + ":" + .parent_session_id),
+                relation_kind: (.relation_kind // "clone"),
+                relation_created_at: (.created_at // "")
+              }
+            })
+          | from_entries
+        ) as $rx
+      | (
+          $relations[0] // []
+          | sort_by(.parent_agent + ":" + .parent_session_id)
+          | group_by(.parent_agent + ":" + .parent_session_id)
+          | map({
+              key: (.[0].parent_agent + ":" + .[0].parent_session_id),
+              value: {
+                child_refs: map(.child_agent + ":" + .child_session_id),
+                child_count: length
+              }
+            })
+          | from_entries
+        ) as $cx
       | (
           $sessions
           | map(
@@ -1209,6 +1221,8 @@ merge_cache_payload() {
                   tab_name: (($tx[.agent + ":" + .id] // {}).tab_name // "")
                 }
               + ($gx[.agent + ":" + .id] // {tags: [], tags_text: ""})
+              + ($rx[.agent + ":" + .id] // {parent_ref: "", relation_kind: "", relation_created_at: ""})
+              + ($cx[.agent + ":" + .id] // {child_refs: [], child_count: 0})
             )
           | sort_by(.ref)
           | group_by(.ref)
@@ -1230,6 +1244,214 @@ sort_cache_file() {
     | sort_by(-(.pinned // 0), -(.updated_epoch // 0), .agent, .id)
   ' "$cache_file" >"$tmp_file"
   mv "$tmp_file" "$cache_file"
+}
+
+qmd_cmd() {
+  command qmd "$@" "--index=$ASM_QMD_INDEX_NAME"
+}
+
+qmd_collection_exists() {
+  qmd_available || return 1
+  qmd_cmd collection list 2>/dev/null | rg -q "^${ASM_QMD_COLLECTION_NAME} \\(qmd://"
+}
+
+qmd_collection_file_count() {
+  qmd_available || return 1
+  qmd_cmd ls "$ASM_QMD_COLLECTION_NAME" 2>/dev/null | awk 'NF{c++} END{print c+0}'
+}
+
+qmd_doc_dir_file_count() {
+  find "$ASM_QMD_DOC_DIR" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' '
+}
+
+qmd_cache_doc_count() {
+  jq 'length' "$1"
+}
+
+qmd_sync_stamp_value() {
+  if [[ -f "$ASM_QMD_SYNC_STAMP" ]]; then
+    cat "$ASM_QMD_SYNC_STAMP"
+  else
+    print -r -- ""
+  fi
+}
+
+qmd_doc_name_for_ref() {
+  local ref="$1"
+  print -r -- "${ref//:/___}.md"
+}
+
+qmd_ref_for_doc_uri() {
+  local uri="$1"
+  if [[ "$uri" == qmd://*/*/* ]]; then
+    local tail="${uri#qmd://*/}"
+    local agent="${tail%%/*}"
+    local name="${tail##*/}"
+    name="${name%.md}"
+    [[ -n "$agent" && -n "$name" ]] && {
+      print -r -- "${agent}:${name}"
+      return 0
+    }
+  fi
+  local name="${uri##*/}"
+  name="${name%.md}"
+  print -r -- "${name//___/:}"
+}
+
+write_qmd_doc_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local target_file="$3"
+  local agent session_id title alias_text display_title cached_cwd cwd updated_display tags_text recent_excerpt tmp_file
+  agent="${ref%%:*}"
+  session_id="${ref#*:}"
+  title="$(clean_text "$(field_for_ref "$cache_file" "$ref" "title")")"
+  alias_text="$(clean_text "$(field_for_ref "$cache_file" "$ref" "alias")")"
+  display_title="${alias_text:-$title}"
+  [[ -n "$display_title" ]] || display_title="$ref"
+  cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  updated_display="$(field_for_ref "$cache_file" "$ref" "updated_display")"
+  tags_text="$(field_for_ref "$cache_file" "$ref" "tags_text")"
+  recent_excerpt="$(clean_text "$(recent_preview_text_for_ref "$cache_file" "$ref")")"
+  tmp_file="$(mktemp)"
+
+  cat >"$tmp_file" <<EOF
+---
+ref: "$ref"
+agent: "$agent"
+session_id: "$session_id"
+cwd: "$cwd"
+updated: "$updated_display"
+tags: "$tags_text"
+---
+
+# $display_title
+
+ref: $ref
+agent: $agent
+session_id: $session_id
+cwd: $cwd
+updated: $updated_display
+tags: ${tags_text:-"-"}
+
+## Summary
+$display_title
+
+## Recent Excerpt
+${recent_excerpt:-No recent excerpt was extracted.}
+EOF
+
+  if [[ -f "$target_file" ]] && cmp -s "$tmp_file" "$target_file"; then
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  mv "$tmp_file" "$target_file"
+  return 0
+}
+
+qmd_sync_signature_for_cache() {
+  local cache_file="$1"
+  python3 - "$cache_file" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+rows = json.loads(path.read_text(encoding="utf-8"))
+payload = [
+    {
+        "ref": row.get("ref", ""),
+        "updated_display": row.get("updated_display", ""),
+        "title": row.get("title", ""),
+        "alias": row.get("alias", ""),
+        "cwd": row.get("cwd", ""),
+        "tags_text": row.get("tags_text", ""),
+    }
+    for row in rows
+]
+encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(encoded).hexdigest())
+PY
+}
+
+qmd_rebuild_docs_from_cache() {
+  local cache_file="$1"
+  local ref doc_path
+
+  mkdir -p "$ASM_QMD_DOC_DIR"
+  rm -f "$ASM_QMD_DOC_DIR"/*.md(N)
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    doc_path="$ASM_QMD_DOC_DIR/$(qmd_doc_name_for_ref "$ref")"
+    write_qmd_doc_for_ref "$cache_file" "$ref" "$doc_path" || true
+  done < <(jq -r '.[].ref' "$cache_file")
+}
+
+ensure_qmd_index_from_cache() {
+  local cache_file="$1"
+  qmd_available || return 1
+  ensure_storage
+
+  local signature doc_count existing_count
+  signature="$(qmd_sync_signature_for_cache "$cache_file")"
+  doc_count="$(qmd_doc_dir_file_count)"
+  existing_count="$(qmd_collection_file_count 2>/dev/null || print 0)"
+
+  if qmd_collection_exists && [[ "$doc_count" -gt 0 ]] && [[ "$existing_count" == "$doc_count" ]] && [[ -f "$ASM_QMD_SYNC_STAMP" ]] && [[ "$(cat "$ASM_QMD_SYNC_STAMP" 2>/dev/null || true)" == "$signature" ]]; then
+    return 0
+  fi
+
+  qmd_rebuild_docs_from_cache "$cache_file"
+  doc_count="$(qmd_doc_dir_file_count)"
+  if ! qmd_collection_exists; then
+    qmd_cmd collection add "$ASM_QMD_DOC_DIR" --name "$ASM_QMD_COLLECTION_NAME" --mask '**/*.md' >/dev/null 2>&1 || return 1
+  fi
+  qmd_cmd update >/dev/null 2>&1 || return 1
+  print -r -- "$signature" >"$ASM_QMD_SYNC_STAMP"
+}
+
+qmd_rank_refs_for_query() {
+  local cache_file="$1"
+  local query="$2"
+  local limit="${3:-40}"
+  [[ -n "$(clean_text "$query")" ]] || return 1
+  qmd_available || return 1
+  ensure_qmd_index_from_cache "$cache_file" || return 1
+
+  local results
+  results="$(qmd_cmd query "$query" -c "$ASM_QMD_COLLECTION_NAME" -n "$limit" --json 2>/dev/null | sed -n '/^\[/,$p' || true)"
+  [[ -n "$results" && "$results" != "No results found." ]] || return 1
+
+  jq -r '.[].file // empty' <<<"$results" \
+    | while IFS= read -r uri; do
+        [[ -n "$uri" ]] || continue
+        qmd_ref_for_doc_uri "$uri"
+      done \
+    | awk '!seen[$0]++'
+}
+
+apply_query_ranking_to_cache_file() {
+  local cache_file="$1"
+  local query="$2"
+  local -a ranked_refs
+  local ranked_refs_json sorted_tmp
+  ranked_refs=("${(@f)$(qmd_rank_refs_for_query "$cache_file" "$query" 40 2>/dev/null || true)}")
+  if (( ${#ranked_refs[@]} > 0 )); then
+    ranked_refs_json="$(printf '%s\n' "${ranked_refs[@]}" | jq -R . | jq -s .)"
+  else
+    ranked_refs_json='[]'
+  fi
+
+  sorted_tmp="$(mktemp)"
+  if run_runtime_py rank-query "$cache_file" "$query" "$ranked_refs_json" >"$sorted_tmp" 2>/dev/null; then
+    mv "$sorted_tmp" "$cache_file"
+  else
+    rm -f "$sorted_tmp"
+    return 1
+  fi
 }
 
 toggle_pin_in_cache() {
@@ -1383,29 +1605,52 @@ move_refs_to_tab_interactive() {
   esac
 }
 
+create_new_tab_for_refs_interactive() {
+  local cache_file="$1"
+  shift
+  local refs=("$@")
+  [[ ${#refs[@]} > 0 ]] || return 0
+  local target_tab
+  target_tab="$(prompt_tab_name)"
+  [[ -n "$target_tab" ]] || return 0
+  assign_ref_to_cache_tab "$cache_file" "$target_tab" "${refs[@]}"
+}
+
 render_lines() {
   local cache_file="$1"
   local active_tab="${2:-All}"
-  run_runtime_py render-lines "$cache_file" "$active_tab" "$ASM_NOW_EPOCH"
+  local query="${3:-}"
+  run_runtime_py render-lines "$cache_file" "$active_tab" "$ASM_NOW_EPOCH" "$query"
 }
 
 render_picker_rows() {
   local cache_file="$1"
-  local state_file="$2"
-  local mode active_tab
-  mode="$(picker_state_mode "$state_file")"
-  if [[ "$mode" == "tab-target" ]]; then
-    picker_tab_target_rows
-  else
-    active_tab="$(get_active_tab_name)"
-    render_lines "$cache_file" "$active_tab"
+  local state_file="${2:-}"
+  local query="${3:-}"
+  local active_tab
+  active_tab="$(resolved_active_tab_name)"
+  while IFS= read -r header_line; do
+    printf '__header__\t__header__\t%s\n' "$header_line"
+  done < <(picker_header_text "$active_tab" "$cache_file" "$state_file")
+  if [[ -n "$state_file" && "$(picker_state_mode "$state_file")" == "revive" ]]; then
+    picker_revive_rows "$cache_file" "$(picker_state_primary_ref "$state_file")"
+    return 0
   fi
+  render_lines "$cache_file" "$active_tab" "$query"
 }
 
 record_for_ref() {
   local cache_file="$1"
   local ref="$2"
   jq -c --arg ref "$ref" '.[] | select(.ref == $ref)' "$cache_file" | head -n 1
+}
+
+require_ref_in_cache() {
+  local cache_file="$1"
+  local ref="$2"
+  [[ -n "$(record_for_ref "$cache_file" "$ref")" ]] && return 0
+  print -u2 -- "session not found: $ref"
+  return 1
 }
 
 field_for_ref() {
@@ -1417,6 +1662,13 @@ field_for_ref() {
     | select(.ref == $ref)
     | .[$field] // ""
   ' "$cache_file" | head -n 1
+}
+
+ref_exists_in_cache() {
+  local cache_file="$1"
+  local ref="$2"
+  [[ -n "$ref" && "$ref" == *:* && "$ref" != :* && "$ref" != *: ]] || return 1
+  [[ -n "$(record_for_ref "$cache_file" "$ref")" ]]
 }
 
 resolve_cwd() {
@@ -1441,81 +1693,72 @@ resolve_cwd() {
   esac
 }
 
-update_last_opened() {
-  local ref="$1"
-  local parts
-  parts=("${(@s: :)$(split_ref "$ref")}")
-  local agent_esc id_esc
-  agent_esc="$(sql_escape "${parts[1]}")"
-  id_esc="$(sql_escape "${parts[2]}")"
-  sqlite3_cmd "$ASM_DB" "
-    INSERT INTO session_meta (agent, session_id, last_opened_at)
-    VALUES ('${agent_esc}', '${id_esc}', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-    ON CONFLICT(agent, session_id) DO UPDATE SET
-      last_opened_at = excluded.last_opened_at
-  " >/dev/null
-}
+ensure_claude_project_trusted() {
+  local project_root="$1"
+  local config_file tmp_file
+  [[ -n "$project_root" && -d "$project_root" ]] || return 0
+  [[ "$project_root" != "$HOME" && "$project_root" != "/" ]] || return 0
+  config_file="$HOME/.claude.json"
+  tmp_file="$(mktemp)"
 
-toggle_pin() {
-  local ref="$1"
-  local parts
-  parts=("${(@s: :)$(split_ref "$ref")}")
-  local agent_esc id_esc
-  agent_esc="$(sql_escape "${parts[1]}")"
-  id_esc="$(sql_escape "${parts[2]}")"
-
-  sqlite3_cmd "$ASM_DB" "
-    INSERT INTO session_meta (agent, session_id, pinned)
-    VALUES ('${agent_esc}', '${id_esc}', 1)
-    ON CONFLICT(agent, session_id) DO UPDATE SET
-      pinned = CASE session_meta.pinned WHEN 1 THEN 0 ELSE 1 END
-  " >/dev/null
-}
-
-set_pin_for_ref() {
-  local ref="$1"
-  local desired="${2:-1}"
-  local parts
-  parts=("${(@s: :)$(split_ref "$ref")}")
-  local agent_esc id_esc desired_pin
-  agent_esc="$(sql_escape "${parts[1]}")"
-  id_esc="$(sql_escape "${parts[2]}")"
-  if [[ "$desired" == "0" ]]; then
-    desired_pin=0
+  if [[ -f "$config_file" ]]; then
+    jq --arg path "$project_root" '
+      .projects = ((.projects // {}) + {
+        ($path): ((.projects[$path] // {}) + {hasTrustDialogAccepted: true})
+      })
+    ' "$config_file" >"$tmp_file" 2>/dev/null || {
+      rm -f "$tmp_file"
+      return 0
+    }
   else
-    desired_pin=1
+    jq -n --arg path "$project_root" '
+      {projects: {($path): {hasTrustDialogAccepted: true}}}
+    ' >"$tmp_file" 2>/dev/null || {
+      rm -f "$tmp_file"
+      return 0
+    }
   fi
 
-  sqlite3_cmd "$ASM_DB" "
-    INSERT INTO session_meta (agent, session_id, pinned)
-    VALUES ('${agent_esc}', '${id_esc}', ${desired_pin})
-    ON CONFLICT(agent, session_id) DO UPDATE SET
-      pinned = excluded.pinned
-  " >/dev/null
+  if [[ ! -f "$config_file" ]] || ! cmp -s "$tmp_file" "$config_file"; then
+    mv "$tmp_file" "$config_file"
+  else
+    rm -f "$tmp_file"
+  fi
 }
 
-set_alias_for_ref() {
-  local ref="$1"
-  local alias_text="$2"
-  local parts
-  parts=("${(@s: :)$(split_ref "$ref")}")
-  local agent_esc id_esc alias_esc
-  agent_esc="$(sql_escape "${parts[1]}")"
-  id_esc="$(sql_escape "${parts[2]}")"
-  alias_esc="$(sql_escape "$alias_text")"
-
-  sqlite3_cmd "$ASM_DB" "
-    INSERT INTO session_meta (agent, session_id, alias)
-    VALUES ('${agent_esc}', '${id_esc}', '${alias_esc}')
-    ON CONFLICT(agent, session_id) DO UPDATE SET
-      alias = excluded.alias
-  " >/dev/null
-}
-
-resume_command_for_ref() {
+maybe_prepare_claude_launch_for_ref() {
   local cache_file="$1"
   local ref="$2"
+  local override_cwd="${3:-}"
   local agent session_id cached_cwd cwd
+  agent="${ref%%:*}"
+  [[ "$agent" == "claude" ]] || return 0
+  require_ref_in_cache "$cache_file" "$ref" || return 1
+  session_id="${ref#*:}"
+  if [[ -n "$override_cwd" ]]; then
+    cwd="$override_cwd"
+  else
+    cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
+    cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  fi
+  ensure_claude_project_trusted "$cwd"
+}
+
+git_root_for_path() {
+  local path="$1"
+  local probe="$path"
+  [[ -n "$probe" ]] || return 0
+  [[ -d "$probe" ]] || probe="${probe:h}"
+  [[ -d "$probe" ]] || return 0
+  command -v git >/dev/null 2>&1 || return 0
+  git -C "$probe" rev-parse --show-toplevel 2>/dev/null | head -n 1
+}
+
+handoff_launch_cwd_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local turns="${3:-0}"
+  local agent session_id cached_cwd cwd scan_turns hints hint_path candidate git_root
 
   agent="${ref%%:*}"
   session_id="${ref#*:}"
@@ -1523,9 +1766,70 @@ resume_command_for_ref() {
   cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
   [[ -n "$cwd" ]] || cwd="$HOME"
 
+  if [[ "$cwd" != "$HOME" && "$cwd" != "/" && -d "$cwd" ]]; then
+    print -r -- "$cwd"
+    return 0
+  fi
+
+  scan_turns="$turns"
+  (( scan_turns > 0 )) || scan_turns=12
+  hints="$(file_hints_for_ref "$cache_file" "$ref" "$scan_turns")"
+  while IFS= read -r hint_path; do
+    [[ -n "$hint_path" ]] || continue
+    candidate="$hint_path"
+    [[ -d "$candidate" ]] || candidate="${candidate:h}"
+    [[ -d "$candidate" ]] || continue
+    [[ "$candidate" == "$HOME" || "$candidate" == "/" ]] && continue
+    git_root="$(git_root_for_path "$candidate")"
+    if [[ -n "$git_root" && -d "$git_root" ]]; then
+      print -r -- "$git_root"
+      return 0
+    fi
+    print -r -- "$candidate"
+    return 0
+  done <<<"$hints"
+
+  print -r -- "$cwd"
+}
+
+update_last_opened() {
+  local ref="$1"
+  run_store_py update-last-opened "$ASM_DB" "$ref" >/dev/null
+}
+
+record_session_relation() {
+  local child_ref="$1"
+  local parent_ref="$2"
+  local relation_kind="${3:-clone}"
+  run_store_py record-relation "$ASM_DB" "$child_ref" "$parent_ref" "$relation_kind" >/dev/null
+}
+
+toggle_pin() {
+  local ref="$1"
+  run_store_py toggle-pin "$ASM_DB" "$ref" >/dev/null
+}
+
+set_pin_for_ref() {
+  local ref="$1"
+  local desired="${2:-1}"
+  run_store_py set-pin "$ASM_DB" "$ref" "$desired" >/dev/null
+}
+
+set_alias_for_ref() {
+  local ref="$1"
+  local alias_text="$2"
+  run_store_py set-alias "$ASM_DB" "$ref" "$alias_text" >/dev/null
+}
+
+resume_command_for_agent_session() {
+  local agent="$1"
+  local session_id="$2"
+  local cwd="$3"
+  [[ -n "$cwd" ]] || cwd="$HOME"
+
   case "$agent" in
     codex)
-      print -r -- "cd $(shell_quote "$cwd") && codex resume $(shell_quote "$session_id")"
+      print -r -- "cd $(shell_quote "$cwd") && codex --dangerously-bypass-approvals-and-sandbox resume $(shell_quote "$session_id")"
       ;;
     claude)
       print -r -- "cd $(shell_quote "$cwd") && claude --dangerously-skip-permissions --resume $(shell_quote "$session_id")"
@@ -1545,11 +1849,25 @@ resume_command_for_ref() {
   esac
 }
 
-clone_command_for_ref() {
+resume_command_for_ref() {
   local cache_file="$1"
   local ref="$2"
   local agent session_id cached_cwd cwd
 
+  require_ref_in_cache "$cache_file" "$ref" || return 1
+  agent="${ref%%:*}"
+  session_id="${ref#*:}"
+  cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  resume_command_for_agent_session "$agent" "$session_id" "$cwd"
+}
+
+raw_clone_command_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local agent session_id cached_cwd cwd
+
+  require_ref_in_cache "$cache_file" "$ref" || return 1
   agent="${ref%%:*}"
   session_id="${ref#*:}"
   cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
@@ -1567,6 +1885,36 @@ clone_command_for_ref() {
       return 1
       ;;
   esac
+}
+
+clone_command_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  require_ref_in_cache "$cache_file" "$ref" || return 1
+  raw_clone_command_for_ref "$cache_file" "$ref" >/dev/null || return 1
+  print -r -- "command asm __clone $(shell_quote "$ref")"
+}
+
+refs_for_agent_from_cache() {
+  local cache_file="$1"
+  local agent="$2"
+  jq -r --arg agent "$agent" '.[] | select(.agent == $agent) | .ref' "$cache_file"
+}
+
+newest_new_ref_for_agent() {
+  local before_file="$1"
+  local after_file="$2"
+  local agent="$3"
+  jq -r --arg agent "$agent" --slurpfile before "$before_file" '
+    ($before[0] // [] | map({key: ., value: true}) | from_entries) as $seen
+    | [
+        .[]
+        | select(.agent == $agent)
+        | select(($seen[.ref] // false) | not)
+      ]
+    | sort_by(-(.updated_epoch // 0))
+    | .[0].ref // empty
+  ' "$after_file"
 }
 
 transcript_path_for_ref() {
@@ -1813,8 +2161,265 @@ export_bundle_for_ref() {
   print -r -- "$out_file"
 }
 
+format_recent_messages_plain() {
+  local ref="$1"
+  local turns="${2:-24}"
+  local lines role content
+  lines="$(recent_messages_for_ref "$ref" "$turns")"
+  [[ -n "$lines" ]] || return 0
+  while IFS=$'\t' read -r role content; do
+    [[ -n "$content" ]] || continue
+    print -r -- "[$role] $(clean_text "$content")"
+    print
+  done <<<"$lines"
+}
+
+build_inspect_text() {
+  local cache_file="$1"
+  local ref="$2"
+  local view="${3:-overview}"
+  local turns="${4:-24}"
+  local max_chars="${5:-20000}"
+  local include_files="${6:-1}"
+  local include_transcript_path="${7:-1}"
+  local rec
+  rec="$(record_for_ref "$cache_file" "$ref")"
+  [[ -n "$rec" ]] || return 1
+
+  local agent session_id title alias_text cached_cwd cwd updated_display last_opened_at tags_text pinned source_file transcript_path
+  local resume_cmd clone_cmd file_hints recent_transcript handoff_flags git_summary active_slot usage_text parent_ref child_count child_refs
+  agent="$(jq -r '.agent' <<<"$rec")"
+  session_id="$(jq -r '.id' <<<"$rec")"
+  title="$(clean_text "$(jq -r '.title // ""' <<<"$rec")")"
+  alias_text="$(clean_text "$(jq -r '.alias // ""' <<<"$rec")")"
+  cached_cwd="$(jq -r '.cwd // ""' <<<"$rec")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  updated_display="$(jq -r '.updated_display // ""' <<<"$rec")"
+  last_opened_at="$(jq -r '.last_opened_at // ""' <<<"$rec")"
+  tags_text="$(jq -r '.tags_text // ""' <<<"$rec")"
+  pinned="$(jq -r '.pinned // 0' <<<"$rec")"
+  source_file="$(jq -r '.source_file // ""' <<<"$rec")"
+  transcript_path="$(transcript_path_for_ref "$ref")"
+  resume_cmd="$(resume_command_for_ref "$cache_file" "$ref" 2>/dev/null || true)"
+  clone_cmd="$(clone_command_for_ref "$cache_file" "$ref" 2>/dev/null || true)"
+  recent_transcript="$(format_recent_messages_plain "$ref" "$turns")"
+  git_summary="$(git_summary_for_rec "$rec")"
+  active_slot="$(active_slot_for_rec "$rec")"
+  usage_text="$(claude_usage_for_rec "$rec")"
+  parent_ref="$(jq -r '.parent_ref // ""' <<<"$rec")"
+  child_count="$(jq -r '.child_count // 0' <<<"$rec")"
+  child_refs="$(jq -r '(.child_refs // []) | join(", ")' <<<"$rec")"
+  file_hints=""
+  if [[ "$include_files" == "1" ]]; then
+    file_hints="$(file_hints_for_ref "$cache_file" "$ref" "$turns")"
+  fi
+  handoff_flags="--mode deep --turns $turns --chars $max_chars"
+  [[ "$include_files" == "1" ]] && handoff_flags="$handoff_flags --include-files"
+  [[ "$include_transcript_path" == "1" ]] && handoff_flags="$handoff_flags --include-transcript-path"
+
+  case "$view" in
+    bundle)
+      build_handoff_markdown "$cache_file" "$ref" "portable" "deep" "$turns" "$max_chars" "$include_files" "$include_transcript_path"
+      return 0
+      ;;
+    transcript)
+      cat <<EOF
+# Session Transcript
+
+- Ref: $ref
+- Agent: $agent
+- Session: $session_id
+- Known title: ${alias_text:-$title}
+- Cwd: ${cwd:-$HOME}
+- Updated: ${updated_display:-"-"}
+- Transcript path: ${transcript_path:-"-"}
+
+Search in pager:
+- / to search
+- n / N for next / previous match
+- q to quit
+
+## Recent Transcript
+${recent_transcript:-No recent transcript was extracted.}
+EOF
+      return 0
+      ;;
+  esac
+
+  cat <<EOF
+# Session Inspect
+
+- Ref: $ref
+- View: $view
+- Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+Search in pager:
+- / to search
+- n / N for next / previous match
+- q to quit
+- asm inspect --bundle $ref
+- asm inspect --transcript $ref
+
+## Session
+- Agent: $agent
+- Session: $session_id
+- Pinned: $([[ "$pinned" == "1" ]] && print yes || print no)
+- Alias: ${alias_text:-"-"}
+- Title: ${title:-"-"}
+- Cwd: ${cwd:-$HOME}
+- Project: $(project_label "$cwd")
+- Forked from: ${parent_ref:-"-"}
+- Forks: ${child_count}${child_refs:+ (${child_refs})}
+- Git: ${git_summary:-"-"}
+- Live: ${active_slot:-"-"}
+- Usage: ${usage_text:-"-"}
+- Updated: ${updated_display:-"-"}
+- Last opened in asm: ${last_opened_at:-"-"}
+- Tags: ${tags_text:-"-"}
+- Source file: ${source_file:-"-"}
+EOF
+  if [[ "$include_transcript_path" == "1" ]]; then
+    print -r -- "- Transcript path: ${transcript_path:-"-"}"
+  fi
+  cat <<EOF
+
+## Commands
+- Resume:
+${resume_cmd:-not available}
+
+- Clone:
+${clone_cmd:-not available}
+
+- Handoff to Codex:
+asm handoff --to codex $handoff_flags $ref
+
+- Handoff to Claude:
+asm handoff --to claude $handoff_flags $ref
+
+- Handoff to Gemini:
+asm handoff --to gemini $handoff_flags $ref
+
+- Export deep portable bundle:
+asm export --to portable $handoff_flags $ref
+
+## Recent Transcript
+${recent_transcript:-No recent transcript was extracted.}
+EOF
+  if [[ "$include_files" == "1" ]]; then
+    print
+    print -r -- "## File Hints"
+    if [[ -n "$file_hints" ]]; then
+      while IFS= read -r hint_file; do
+        [[ -n "$hint_file" ]] || continue
+        print -r -- "- $hint_file"
+      done <<<"$file_hints"
+    else
+      print -r -- "- No file hints were extracted automatically."
+    fi
+  fi
+}
+
+open_inspect_file() {
+  local inspect_file="$1"
+  [[ -f "$inspect_file" ]] || return 1
+
+  if [[ -n "${ASM_INSPECT_PAGER:-}" ]]; then
+    eval "${ASM_INSPECT_PAGER} $(shell_quote "$inspect_file")"
+    return $?
+  fi
+
+  if inspect_helper_exists && [[ -t 0 && -t 1 ]]; then
+    python3 "$ASM_INSPECT_PY" "$inspect_file"
+    return $?
+  fi
+
+  if command_exists less; then
+    local -a pager_cmd
+    pager_cmd=(less -R -M -i -j4)
+    [[ -n "${ASM_INSPECT_NO_ALTSCREEN:-}" ]] && pager_cmd+=(-X)
+    "${pager_cmd[@]}" "$inspect_file"
+    return $?
+  fi
+
+  cat "$inspect_file"
+}
+
+picker_shortcuts_rows() {
+  printf '%s\t%s\t%s\n' '?' 'picker.shortcuts' 'Show this keyboard shortcuts reference'
+  printf '%s\t%s\t%s\n' 'f1' 'picker.jump' 'Jump mode for quick movement'
+  printf '%s\t%s\t%s\n' '1 / 2 / 3' 'picker.preview.mode' 'Switch preview between overview, transcript, and commands'
+  printf '%s\t%s\t%s\n' '/' 'picker.search.enter' 'Enter search mode and type a filter'
+  printf '%s\t%s\t%s\n' '[ / ]' 'picker.tab.cycle' 'Switch the active tab filter'
+  printf '%s\t%s\t%s\n' 'enter' 'session.resume.exact' 'Resume the selected session immediately'
+  printf '%s\t%s\t%s\n' 'v' 'session.revive.menu' 'Open the action menu for resume/tab/window/clone/handoff/export'
+  printf '%s\t%s\t%s\n' 'i' 'session.inspect' 'Open inspect view for the selected session'
+  printf '%s\t%s\t%s\n' 'p' 'session.pin.toggle' 'Toggle pin on selected session(s)'
+  printf '%s\t%s\t%s\n' 't' 'session.tags.edit' 'Edit tags for the selected session'
+  printf '%s\t%s\t%s\n' 'm' 'session.tab.move' 'Move selected session(s) to another tab'
+  printf '%s\t%s\t%s\n' 'n' 'session.tab.new' 'Create a new tab and assign selected session(s)'
+  printf '%s\t%s\t%s\n' 'u' 'session.tab.clear' 'Remove selected session(s) from their tab group'
+  printf '%s\t%s\t%s\n' 'a' 'session.alias.edit' 'Edit alias for the selected session'
+  printf '%s\t%s\t%s\n' 'y' 'session.refs.copy' 'Copy selected refs to clipboard'
+  printf '%s\t%s\t%s\n' 'o' 'session.cwd.cd' 'Change shell cwd to the selected session cwd'
+  printf '%s\t%s\t%s\n' 'c' 'session.clone' 'Clone or fork the selected session when supported'
+  printf '%s\t%s\t%s\n' 'h' 'session.handoff.choose' 'Choose a handoff target and create a bundle'
+  printf '%s\t%s\t%s\n' 'l' 'session.handoff.last' 'Reuse the last handoff target immediately'
+  printf '%s\t%s\t%s\n' 'r' 'picker.refresh' 'Rebuild the session cache'
+  printf '%s\t%s\t%s\n' 'shift-up / shift-down' 'selection.multi' 'Extend multi-selection'
+  printf '%s\t%s\t%s\n' 'esc' 'picker.back' 'Leave search mode or close the picker'
+  printf '%s\t%s\t%s\n' 'pgup / pgdn' 'preview.scroll' 'Scroll the preview pane'
+}
+
+build_shortcuts_markdown() {
+  cat <<'EOF'
+# Keyboard Shortcuts
+
+## Picker
+
+| Keys | Command | Description |
+| --- | --- | --- |
+EOF
+  while IFS=$'\t' read -r keys command description; do
+    [[ -n "$keys" ]] || continue
+    printf '| `%s` | `%s` | %s |\n' "$keys" "$command" "$description"
+  done < <(picker_shortcuts_rows)
+}
+
+show_picker_shortcuts() {
+  local inspect_file
+  inspect_file="$(mktemp)"
+  build_shortcuts_markdown >"$inspect_file"
+  open_inspect_file "$inspect_file"
+  rm -f "$inspect_file"
+}
+
+normalize_handoff_target() {
+  case "${1:-}" in
+    codex|claude|gemini) print -r -- "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+last_handoff_target() {
+  [[ -f "$ASM_LAST_HANDOFF_TARGET_FILE" ]] || return 1
+  local target
+  target="$(<"$ASM_LAST_HANDOFF_TARGET_FILE")"
+  normalize_handoff_target "$target"
+}
+
+remember_handoff_target() {
+  local target
+  target="$(normalize_handoff_target "$1")" || return 1
+  mkdir -p "$ASM_HOME"
+  print -r -- "$target" >"$ASM_LAST_HANDOFF_TARGET_FILE"
+}
+
 choose_handoff_target() {
-  printf '%s\n' codex claude gemini | fzf --height=8 --layout=reverse --prompt='handoff> '
+  local target
+  target="$(printf '%s\n' codex claude gemini | fzf --height=8 --layout=reverse --prompt='handoff> ')" || return 1
+  target="$(normalize_handoff_target "$target")" || return 1
+  remember_handoff_target "$target" || true
+  print -r -- "$target"
 }
 
 handoff_defaults() {
@@ -2140,15 +2745,21 @@ def session_id_from_tokens(agent, agent_index, tokens):
     if agent == "codex":
         for index in range(agent_index + 1, len(tokens) - 1):
             if tokens[index] == "resume":
-                return tokens[index + 1]
+                candidate = tokens[index + 1]
+                if not candidate.startswith("-"):
+                    return candidate
     elif agent in {"claude", "cursor-agent", "gemini"}:
         for index in range(agent_index + 1, len(tokens) - 1):
             if tokens[index] == "--resume":
-                return tokens[index + 1]
+                candidate = tokens[index + 1]
+                if not candidate.startswith("-"):
+                    return candidate
     elif agent == "opencode":
         for index in range(agent_index + 1, len(tokens) - 1):
             if tokens[index] == "-s":
-                return tokens[index + 1]
+                candidate = tokens[index + 1]
+                if not candidate.startswith("-"):
+                    return candidate
 
     return ""
 
@@ -2162,7 +2773,7 @@ def build_restore(agent, command, cwd, session_id):
         return "shell", f"cd {quoted_cwd}"
 
     if agent == "codex" and session_id:
-        return "agent_resume", f"cd {quoted_cwd} && codex resume {quoted_session_id}"
+        return "agent_resume", f"cd {quoted_cwd} && codex --dangerously-bypass-approvals-and-sandbox resume {quoted_session_id}"
     if agent == "claude":
         if session_id:
             return "agent_resume", f"cd {quoted_cwd} && claude --dangerously-skip-permissions --resume {quoted_session_id}"
@@ -2580,10 +3191,13 @@ tell application "iTerm2"
   activate
   set existingIds to id of every window
   if profileName is not "" then
-    create window with profile profileName command shellCommand
+    set newWindow to (create window with profile profileName)
   else
-    create window with default profile command shellCommand
+    set newWindow to (create window with default profile)
   end if
+  tell current session of newWindow
+    write text shellCommand
+  end tell
   repeat 40 times
     set currentIds to id of every window
     repeat with candidateId in currentIds
@@ -2622,10 +3236,13 @@ tell application "iTerm2"
   end repeat
   tell window id targetWindowId
     if profileName is not "" then
-      set newTab to (create tab with profile profileName command shellCommand)
+      set newTab to (create tab with profile profileName)
     else
-      set newTab to (create tab with default profile command shellCommand)
+      set newTab to (create tab with default profile)
     end if
+    tell current session of newTab
+      write text shellCommand
+    end tell
   end tell
   return ""
 end tell
@@ -2658,17 +3275,20 @@ tell application "iTerm2"
   tell current session of current tab of window id targetWindowId
     if splitDirection is "vertical" then
       if profileName is not "" then
-        split vertically with profile profileName command shellCommand
+        set newSession to (split vertically with profile profileName)
       else
-        split vertically with default profile command shellCommand
+        set newSession to (split vertically with default profile)
       end if
     else
       if profileName is not "" then
-        split horizontally with profile profileName command shellCommand
+        set newSession to (split horizontally with profile profileName)
       else
-        split horizontally with default profile command shellCommand
+        set newSession to (split horizontally with default profile)
       end if
     end if
+    tell newSession
+      write text shellCommand
+    end tell
   end tell
 end tell
 APPLESCRIPT
@@ -2727,7 +3347,10 @@ restore_iterm_snapshot_file() {
       return 1
     }
     sleep "$ASM_ITERM_RESTORE_DELAY"
-    apply_bounds_to_iterm_window "$new_window_id" "$bounds"
+    apply_bounds_to_iterm_window "$new_window_id" "$bounds" || {
+      print -u2 -- "failed to apply iTerm2 window bounds"
+      return 1
+    }
 
     tab_title="$(jq -r '.tab_title // ""' <<<"$tab_json")"
     direction="$(jq -r '.split_direction // "horizontal"' <<<"$tab_json")"
@@ -2737,10 +3360,16 @@ restore_iterm_snapshot_file() {
       restore_kind="$(jq -r '.restore_kind // "command"' <<<"$session_json")"
       profile="$(jq -r '.profile // ""' <<<"$session_json")"
       [[ -n "$cmd" ]] || cmd="cd $(shell_quote "$HOME")"
-      split_layout_session_in_iterm "$new_window_id" "$direction" "$cmd" "$restore_kind" "$profile"
+      split_layout_session_in_iterm "$new_window_id" "$direction" "$cmd" "$restore_kind" "$profile" || {
+        print -u2 -- "failed to split iTerm2 session"
+        return 1
+      }
       sleep "$ASM_ITERM_RESTORE_DELAY"
     done < <(jq -c '.sessions[1:][]?' <<<"$tab_json")
-    set_current_tab_title_in_iterm "$new_window_id" "$tab_title"
+    set_current_tab_title_in_iterm "$new_window_id" "$tab_title" || {
+      print -u2 -- "failed to set iTerm2 tab title"
+      return 1
+    }
 
     while IFS= read -r tab_json; do
       [[ -n "$tab_json" ]] || continue
@@ -2750,7 +3379,10 @@ restore_iterm_snapshot_file() {
       restore_kind="$(jq -r '.restore_kind // "command"' <<<"$first_session")"
       profile="$(jq -r '.profile // ""' <<<"$first_session")"
       [[ -n "$cmd" ]] || cmd="cd $(shell_quote "$HOME")"
-      open_layout_tab_in_iterm "$new_window_id" "$cmd" "$restore_kind" "$profile"
+      open_layout_tab_in_iterm "$new_window_id" "$cmd" "$restore_kind" "$profile" || {
+        print -u2 -- "failed to create iTerm2 tab"
+        return 1
+      }
       sleep "$ASM_ITERM_RESTORE_DELAY"
 
       tab_title="$(jq -r '.tab_title // ""' <<<"$tab_json")"
@@ -2761,10 +3393,16 @@ restore_iterm_snapshot_file() {
         restore_kind="$(jq -r '.restore_kind // "command"' <<<"$session_json")"
         profile="$(jq -r '.profile // ""' <<<"$session_json")"
         [[ -n "$cmd" ]] || cmd="cd $(shell_quote "$HOME")"
-        split_layout_session_in_iterm "$new_window_id" "$direction" "$cmd" "$restore_kind" "$profile"
+        split_layout_session_in_iterm "$new_window_id" "$direction" "$cmd" "$restore_kind" "$profile" || {
+          print -u2 -- "failed to split iTerm2 session"
+          return 1
+        }
         sleep "$ASM_ITERM_RESTORE_DELAY"
       done < <(jq -c '.sessions[1:][]?' <<<"$tab_json")
-      set_current_tab_title_in_iterm "$new_window_id" "$tab_title"
+      set_current_tab_title_in_iterm "$new_window_id" "$tab_title" || {
+        print -u2 -- "failed to set iTerm2 tab title"
+        return 1
+      }
     done < <(jq -c '.tabs[1:][]?' <<<"$window_json")
   done < <(jq -c '.windows[]?' "$snapshot_path")
 }
@@ -2853,7 +3491,7 @@ patterns = [
     (r'claude(?:\s+--[^\s]+)*\s+--resume\s+([0-9a-fA-F-]{36})', 'claude:{}'),
     (r'gemini --resume ([0-9a-fA-F-]{36})', 'gemini:{}'),
     (r'cursor-agent --resume ([0-9a-fA-F-]{36})', 'cursor-agent:{}'),
-    (r'codex resume ([A-Za-z0-9._:-]+)', 'codex:{}'),
+    (r'codex(?:\s+--[^\s]+)*\s+resume\s+(?!-)([A-Za-z0-9._:-]+)', 'codex:{}'),
     (r'opencode -s ([A-Za-z0-9._:-]+)', 'opencode:{}'),
 ]
 found = None
@@ -2894,6 +3532,7 @@ summon_tab_to_iterm() {
   local ref cmd
   while IFS= read -r ref; do
     [[ -n "$ref" ]] || continue
+    maybe_prepare_claude_launch_for_ref "$cache_file" "$ref"
     cmd="$(resume_command_for_ref "$cache_file" "$ref")"
     if [[ "$mode" == "window" ]]; then
       open_command_in_iterm_window "$cmd"
@@ -2927,15 +3566,14 @@ revive_session_flow() {
     preview_cmd="ASM_CACHE_FILE=$(shell_quote "$cache_file") command asm __revive_preview $(shell_quote "$ref") {1} 2>/dev/null || true"
     action="$(
       {
-        printf 'resume\tResume exact\tReopen the original %s session in %s\n' "$agent" "$(project_label "$cwd")"
-        printf 'tab\tResume in new iTerm tab\tOpen the exact session in a fresh iTerm2 tab\n'
-        printf 'window\tResume in new iTerm window\tOpen the exact session in a fresh iTerm2 window\n'
+        printf 'handoff\tHandoff other-agent\tCreate a portable context bundle and continue elsewhere\n'
         if [[ "$clone_supported" == "1" ]]; then
           printf 'clone\tClone same-agent\tFork this %s session and continue in a new one\n' "$agent"
         fi
-        printf 'handoff\tHandoff other-agent\tCreate a portable context bundle and continue elsewhere\n'
-        printf 'cd\tCd only\tJump to the original working directory\n'
         printf 'export\tExport bundle\tSave a portable bundle without opening a session\n'
+        printf 'tab\tResume in new iTerm tab\tOpen the exact session in a fresh iTerm2 tab\n'
+        printf 'window\tResume in new iTerm window\tOpen the exact session in a fresh iTerm2 window\n'
+        printf 'cd\tCd only\tJump to the original working directory\n'
         printf 'copy\tCopy ref\tCopy %s\n' "$ref"
         printf 'back\tBack\tReturn to the session list\n'
       } | fzf \
@@ -2955,34 +3593,26 @@ revive_session_flow() {
     debug_log "revive action ref=$ref action=$action"
 
     case "$action" in
-      resume)
-        update_last_opened "$ref"
-        emit_shell_cmd "$exact_resume_cmd"
-        return 0
-        ;;
       tab)
         update_last_opened "$ref"
+        maybe_prepare_claude_launch_for_ref "$cache_file" "$ref"
         emit_shell_cmd "command asm __iterm_tab $(shell_quote "$exact_resume_cmd")"
         return 0
         ;;
       window)
         update_last_opened "$ref"
+        maybe_prepare_claude_launch_for_ref "$cache_file" "$ref"
         emit_shell_cmd "command asm __iterm_window $(shell_quote "$exact_resume_cmd")"
         return 0
         ;;
       clone)
         update_last_opened "$ref"
+        maybe_prepare_claude_launch_for_ref "$cache_file" "$ref"
         emit_shell_cmd "$(clone_command_for_ref "$cache_file" "$ref")"
         return 0
         ;;
       handoff)
-        local target_agent handoff_cmd
-        target_agent="$(choose_handoff_target)" || continue
-        handoff_cmd="$(handoff_command_for_ref "$cache_file" "$ref" "$target_agent")" || {
-          notice "handoff is available to codex, claude, or gemini"
-          continue
-        }
-        emit_shell_cmd "$handoff_cmd"
+        emit_handoff_for_ref "$cache_file" "$ref" choose || continue
         return 0
         ;;
       cd)
@@ -3006,6 +3636,61 @@ revive_session_flow() {
   done
 }
 
+handle_revive_action() {
+  local cache_file="$1"
+  local ref="$2"
+  local action="$3"
+  local cwd exact_resume_cmd
+  cwd="$(resolve_cwd "${ref%%:*}" "${ref#*:}" "$(field_for_ref "$cache_file" "$ref" "cwd")")"
+  exact_resume_cmd="$(resume_command_for_ref "$cache_file" "$ref")"
+  case "$action" in
+    tab)
+      update_last_opened "$ref"
+      maybe_prepare_claude_launch_for_ref "$cache_file" "$ref"
+      emit_shell_cmd "command asm __iterm_tab $(shell_quote "$exact_resume_cmd")"
+      return 0
+      ;;
+    window)
+      update_last_opened "$ref"
+      maybe_prepare_claude_launch_for_ref "$cache_file" "$ref"
+      emit_shell_cmd "command asm __iterm_window $(shell_quote "$exact_resume_cmd")"
+      return 0
+      ;;
+    clone)
+      update_last_opened "$ref"
+      maybe_prepare_claude_launch_for_ref "$cache_file" "$ref"
+      emit_shell_cmd "$(clone_command_for_ref "$cache_file" "$ref")"
+      return 0
+      ;;
+    handoff)
+      emit_handoff_for_ref "$cache_file" "$ref" choose
+      return $?
+      ;;
+    cd)
+      emit_shell_cmd "cd $(shell_quote "$cwd")"
+      return 0
+      ;;
+    export)
+      local out_file
+      out_file="$(export_bundle_for_ref "$cache_file" "$ref" portable)"
+      copy_to_clipboard "$out_file"
+      notice "exported: $out_file"
+      return 2
+      ;;
+    copy)
+      copy_to_clipboard "$ref"
+      notice "copied: $ref"
+      return 2
+      ;;
+    back)
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 handoff_command_for_ref() {
   local cache_file="$1"
   local ref="$2"
@@ -3020,9 +3705,9 @@ handoff_command_for_ref() {
   bundle_file="$(export_bundle_for_ref "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "$include_files" "$include_transcript_path")"
   agent="${ref%%:*}"
   session_id="${ref#*:}"
-  cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
-  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  cwd="$(handoff_launch_cwd_for_ref "$cache_file" "$ref" "$turns")"
   [[ -n "$cwd" ]] || cwd="$HOME"
+  [[ "$target_agent" == "claude" ]] && ensure_claude_project_trusted "$cwd"
 
   case "$target_agent" in
     codex)
@@ -3038,6 +3723,33 @@ handoff_command_for_ref() {
       return 1
       ;;
   esac
+}
+
+emit_handoff_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local target_hint="${3:-choose}"
+  local target_agent handoff_cmd
+
+  case "$target_hint" in
+    choose|"")
+      target_agent="$(choose_handoff_target)" || return 1
+      ;;
+    last)
+      target_agent="$(last_handoff_target 2>/dev/null || true)"
+      [[ -n "$target_agent" ]] || target_agent="$(choose_handoff_target)" || return 1
+      ;;
+    *)
+      target_agent="$(normalize_handoff_target "$target_hint")" || return 1
+      remember_handoff_target "$target_agent" || true
+      ;;
+  esac
+
+  handoff_cmd="$(handoff_command_for_ref "$cache_file" "$ref" "$target_agent")" || {
+    notice "handoff is available to codex, claude, or gemini"
+    return 1
+  }
+  emit_shell_cmd "$handoff_cmd"
 }
 
 print_recent_preview() {
@@ -3092,16 +3804,179 @@ recent_preview_text_for_ref() {
   print_recent_preview "$rec"
 }
 
-preview_ref() {
-  local ref="$1"
-  local cache_file="${ASM_CACHE_FILE:-}"
-  [[ -n "$cache_file" && -f "$cache_file" ]] || return 0
+first_recent_context_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local recent_text line
+  recent_text="$(recent_preview_text_for_ref "$cache_file" "$ref")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    print -r -- "$line"
+    return 0
+  done <<<"$recent_text"
+}
 
-  local rec
+jira_key_from_text() {
+  local text="${1:-}"
+  [[ -n "$text" ]] || return 0
+  print -r -- "$text" | rg -o -m1 '[A-Z][A-Z0-9]+-[0-9]+' 2>/dev/null || true
+}
+
+jira_key_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local rec summary recent_text tags_text key
   rec="$(record_for_ref "$cache_file" "$ref")"
   [[ -n "$rec" ]] || return 0
+  summary="$(jq -r '(.alias // "") as $a | if $a != "" then $a else (.title // "") end' <<<"$rec")"
+  recent_text="$(first_recent_context_for_ref "$cache_file" "$ref")"
+  tags_text="$(jq -r '.tags_text // ""' <<<"$rec")"
+  for key in "$(jira_key_from_text "$summary")" "$(jira_key_from_text "$recent_text")" "$(jira_key_from_text "$tags_text")"; do
+    [[ -n "$key" ]] || continue
+    print -r -- "$key"
+    return 0
+  done
+}
 
-  local agent session_id title alias_text pinned cached_cwd cwd updated_display tags_text
+summary_text_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local rec summary recent_text
+  rec="$(record_for_ref "$cache_file" "$ref")"
+  [[ -n "$rec" ]] || return 0
+  summary="$(clean_text "$(jq -r '(.alias // "") as $a | if $a != "" then $a else (.title // "") end' <<<"$rec")")"
+  recent_text="$(clean_text "$(first_recent_context_for_ref "$cache_file" "$ref")")"
+  if [[ -n "$summary" && -n "$recent_text" && "$recent_text" != "No recent preview available." ]]; then
+    if [[ "$recent_text" != *"$summary"* ]]; then
+      print -r -- "$(truncate_text "$summary" 120) | $(truncate_text "$recent_text" 140)"
+      return 0
+    fi
+  fi
+  print -r -- "$(truncate_text "${summary:-$recent_text}" 180)"
+}
+
+picker_jira_key_for_rec() {
+  local rec="$1"
+  local alias_text title tags_text key
+  alias_text="$(jq -r '.alias // ""' <<<"$rec")"
+  title="$(jq -r '.title // ""' <<<"$rec")"
+  tags_text="$(jq -r '.tags_text // ""' <<<"$rec")"
+  for key in "$(jira_key_from_text "$alias_text")" "$(jira_key_from_text "$title")" "$(jira_key_from_text "$tags_text")"; do
+    [[ -n "$key" ]] || continue
+    print -r -- "$key"
+    return 0
+  done
+}
+
+picker_summary_text_for_rec() {
+  local rec="$1"
+  local alias_text title
+  alias_text="$(clean_text "$(jq -r '.alias // ""' <<<"$rec")")"
+  title="$(clean_text "$(jq -r '.title // ""' <<<"$rec")")"
+  if [[ -n "$alias_text" ]]; then
+    if [[ -n "$title" && "$title" != "$alias_text" ]]; then
+      print -r -- "$(truncate_text "$alias_text" 120) | $(truncate_text "$title" 140)"
+      return 0
+    fi
+    print -r -- "$(truncate_text "$alias_text" 180)"
+    return 0
+  fi
+  print -r -- "$(truncate_text "$title" 180)"
+}
+
+git_summary_for_rec() {
+  local rec="$1"
+  local branch is_worktree
+  branch="$(jq -r '.git_branch // ""' <<<"$rec")"
+  is_worktree="$(jq -r '.git_is_worktree // 0' <<<"$rec")"
+  [[ -n "$branch" ]] || return 0
+  if [[ "$is_worktree" == "1" ]]; then
+    print -r -- "$branch (worktree)"
+  else
+    print -r -- "$branch"
+  fi
+}
+
+active_slot_for_rec() {
+  local rec="$1"
+  jq -r 'if (.is_active // 0) == 1 then "\(.active_window // 0):\(.active_tab // 0)" else "" end' <<<"$rec"
+}
+
+claude_usage_for_rec() {
+  local rec="$1"
+  jq -r '.claude_usage_text // ""' <<<"$rec"
+}
+
+live_iterm_session_preview() {
+  local window_index="$1"
+  local tab_index="$2"
+  local session_index="$3"
+  [[ "$window_index" == <-> && "$tab_index" == <-> && "$session_index" == <-> ]] || return 0
+  (( window_index > 0 && tab_index > 0 && session_index > 0 )) || return 0
+  iterm_running || return 0
+  run_osascript_script 2 <<APPLESCRIPT 2>/dev/null || true
+tell application "iTerm2"
+  if (count of windows) < $window_index then return ""
+  tell window $window_index
+    if (count of tabs) < $tab_index then return ""
+    tell tab $tab_index
+      if (count of sessions) < $session_index then return ""
+      try
+        set bodyText to contents of session $session_index
+      on error
+        set bodyText to ""
+      end try
+      if (length of bodyText) > 5000 then
+        set bodyText to text -5000 thru -1 of bodyText
+      end if
+      return bodyText
+    end tell
+  end tell
+end tell
+APPLESCRIPT
+}
+
+live_preview_for_rec() {
+  local rec="$1"
+  local is_active window_index tab_index session_index
+  is_active="$(jq -r '.is_active // 0' <<<"$rec")"
+  [[ "$is_active" == "1" ]] || return 0
+  window_index="$(jq -r '.active_window // 0' <<<"$rec")"
+  tab_index="$(jq -r '.active_tab // 0' <<<"$rec")"
+  session_index="$(jq -r '.active_session_order // 0' <<<"$rec")"
+  live_iterm_session_preview "$window_index" "$tab_index" "$session_index"
+}
+
+print_session_preview_block() {
+  local rec="$1"
+  local usage_text active_slot live_preview
+  usage_text="$(claude_usage_for_rec "$rec")"
+  active_slot="$(active_slot_for_rec "$rec")"
+  [[ -n "$usage_text" ]] && {
+    print -r -- "Usage:"
+    print -r -- "$usage_text"
+    print
+  }
+  [[ -n "$active_slot" ]] && {
+    print -r -- "Live:"
+    print -r -- "$active_slot"
+    print
+  }
+  live_preview="$(live_preview_for_rec "$rec")"
+  if [[ -n "$live_preview" ]]; then
+    print -r -- "Live Output:"
+    print -r -- "$live_preview"
+    return 0
+  fi
+  print -r -- "Transcript:"
+  print_recent_preview "$rec"
+}
+
+print_session_preview_summary() {
+  local cache_file="$1"
+  local ref="$2"
+  local rec="$3"
+  local agent session_id title alias_text pinned cached_cwd cwd updated_display tags_text git_summary active_slot usage_text summary_text jira_key jira_url parent_ref child_count child_refs
   agent="$(jq -r '.agent' <<<"$rec")"
   session_id="$(jq -r '.id' <<<"$rec")"
   title="$(jq -r '.title // ""' <<<"$rec")"
@@ -3111,27 +3986,209 @@ preview_ref() {
   cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
   updated_display="$(jq -r '.updated_display // ""' <<<"$rec")"
   tags_text="$(jq -r '.tags_text // ""' <<<"$rec")"
+  git_summary="$(git_summary_for_rec "$rec")"
+  active_slot="$(active_slot_for_rec "$rec")"
+  usage_text="$(claude_usage_for_rec "$rec")"
+  summary_text="$(summary_text_for_ref "$cache_file" "$ref")"
+  parent_ref="$(jq -r '.parent_ref // ""' <<<"$rec")"
+  child_count="$(jq -r '.child_count // 0' <<<"$rec")"
+  child_refs="$(jq -r '(.child_refs // []) | join(", ")' <<<"$rec")"
+  jira_key="$(jira_key_for_ref "$cache_file" "$ref")"
+  jira_url=""
+  if [[ -n "$jira_key" ]]; then
+    load_jira_config >/dev/null 2>&1 || true
+    jira_url="$(jira_issue_url "$jira_key" 2>/dev/null || true)"
+  fi
 
   print -r -- "Agent:        $agent"
   print -r -- "Session:      $session_id"
-  print -r -- "Pinned:       $([[ "$pinned" == "1" ]] && print yes || print no)"
-  print -r -- "Alias:        ${alias_text:-"-"}"
-  print -r -- "Title:        ${title:-"-"}"
-  print -r -- "Tags:         ${tags_text:-"-"}"
+  print -r -- "Title:        ${alias_text:-$title}"
+  [[ -n "$summary_text" ]] && print -r -- "Summary:      ${summary_text}"
   print -r -- "Cwd:          ${cwd:-$HOME}"
+  [[ -n "$parent_ref" ]] && print -r -- "Forked from:  ${parent_ref}"
+  [[ "$child_count" != "0" ]] && print -r -- "Forks:        ${child_count}${child_refs:+ (${child_refs})}"
+  [[ "$pinned" == "1" ]] && print -r -- "Pinned:       yes"
+  [[ -n "$tags_text" ]] && [[ "$tags_text" != "-" ]] && print -r -- "Tags:         ${tags_text}"
+  [[ -n "$git_summary" ]] && print -r -- "Git:          ${git_summary}"
+  [[ -n "$active_slot" ]] && print -r -- "Live:         ${active_slot}"
+  [[ -n "$usage_text" ]] && print -r -- "Usage:        ${usage_text}"
+  [[ -n "$jira_key" ]] && print -r -- "Jira:         ${jira_key}"
+  [[ -n "$jira_url" ]] && print -r -- "Jira URL:     ${jira_url}"
   print -r -- "Updated:      ${updated_display:-"-"}"
-  print
-  print -r -- "Transcript:"
-  print_recent_preview "$rec"
-  print
+}
+
+print_session_preview_commands() {
+  local cache_file="$1"
+  local ref="$2"
+  local rec="$3"
+  local agent cwd jira_key
+  agent="$(jq -r '.agent' <<<"$rec")"
+  cwd="$(resolve_cwd "$agent" "$(jq -r '.id' <<<"$rec")" "$(jq -r '.cwd // ""' <<<"$rec")")"
+  jira_key="$(jira_key_for_ref "$cache_file" "$ref")"
+
   print -r -- "Resume:"
   resume_command_for_ref "$cache_file" "$ref" || true
   print
   print -r -- "Clone:"
   clone_command_for_ref "$cache_file" "$ref" || print -r -- "same-agent clone is not available for $agent"
   print
-  print -r -- "Keys:"
-  print -r -- "enter revive menu | ctrl-p pin | ctrl-t tags | alt-a alias | ctrl-y copy ref | ctrl-o cd | alt-c clone | alt-h handoff"
+  print -r -- "Cd:"
+  print -r -- "cd $(shell_quote "$cwd")"
+  print
+  print -r -- "Handoff:"
+  print -r -- "asm handoff --to codex $ref"
+  print -r -- "asm handoff --to claude $ref"
+  print -r -- "asm handoff --to gemini $ref"
+  print
+  print -r -- "Export:"
+  print -r -- "asm export --to portable $ref"
+  if [[ -n "$jira_key" ]]; then
+    print
+    print -r -- "Jira:"
+    print -r -- "asm jira view $jira_key"
+    print -r -- "asm jira open $jira_key"
+  fi
+}
+
+print_picker_preview_summary() {
+  local rec="$1"
+  local agent session_id title alias_text pinned cached_cwd cwd updated_display tags_text git_summary active_slot usage_text summary_text jira_key parent_ref child_count child_refs
+  agent="$(jq -r '.agent' <<<"$rec")"
+  session_id="$(jq -r '.id' <<<"$rec")"
+  title="$(jq -r '.title // ""' <<<"$rec")"
+  alias_text="$(jq -r '.alias // ""' <<<"$rec")"
+  pinned="$(jq -r '.pinned // 0' <<<"$rec")"
+  cached_cwd="$(jq -r '.cwd // ""' <<<"$rec")"
+  cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  updated_display="$(jq -r '.updated_display // ""' <<<"$rec")"
+  tags_text="$(jq -r '.tags_text // ""' <<<"$rec")"
+  git_summary="$(git_summary_for_rec "$rec")"
+  active_slot="$(active_slot_for_rec "$rec")"
+  usage_text="$(claude_usage_for_rec "$rec")"
+  summary_text="$(picker_summary_text_for_rec "$rec")"
+  parent_ref="$(jq -r '.parent_ref // ""' <<<"$rec")"
+  child_count="$(jq -r '.child_count // 0' <<<"$rec")"
+  child_refs="$(jq -r '(.child_refs // []) | join(", ")' <<<"$rec")"
+  jira_key="$(picker_jira_key_for_rec "$rec")"
+
+  print -r -- "Agent:        $agent"
+  print -r -- "Session:      $session_id"
+  print -r -- "Title:        ${alias_text:-$title}"
+  [[ -n "$summary_text" ]] && print -r -- "Summary:      ${summary_text}"
+  print -r -- "Cwd:          ${cwd:-$HOME}"
+  [[ -n "$parent_ref" ]] && print -r -- "Forked from:  ${parent_ref}"
+  [[ "$child_count" != "0" ]] && print -r -- "Forks:        ${child_count}${child_refs:+ (${child_refs})}"
+  [[ "$pinned" == "1" ]] && print -r -- "Pinned:       yes"
+  [[ -n "$tags_text" ]] && [[ "$tags_text" != "-" ]] && print -r -- "Tags:         ${tags_text}"
+  [[ -n "$git_summary" ]] && print -r -- "Git:          ${git_summary}"
+  [[ -n "$active_slot" ]] && print -r -- "Live:         ${active_slot}"
+  [[ -n "$usage_text" ]] && print -r -- "Usage:        ${usage_text}"
+  [[ -n "$jira_key" ]] && print -r -- "Jira:         ${jira_key}"
+  print -r -- "Updated:      ${updated_display:-"-"}"
+}
+
+print_picker_preview_commands() {
+  local cache_file="$1"
+  local ref="$2"
+  local rec="$3"
+  local agent cwd jira_key
+  agent="$(jq -r '.agent' <<<"$rec")"
+  cwd="$(resolve_cwd "$agent" "$(jq -r '.id' <<<"$rec")" "$(jq -r '.cwd // ""' <<<"$rec")")"
+  jira_key="$(picker_jira_key_for_rec "$rec")"
+
+  print -r -- "Resume:"
+  resume_command_for_ref "$cache_file" "$ref" || true
+  print
+  print -r -- "Clone:"
+  clone_command_for_ref "$cache_file" "$ref" || print -r -- "same-agent clone is not available for $agent"
+  print
+  print -r -- "Cd:"
+  print -r -- "cd $(shell_quote "$cwd")"
+  print
+  print -r -- "Handoff:"
+  print -r -- "asm handoff --to codex $ref"
+  print -r -- "asm handoff --to claude $ref"
+  print -r -- "asm handoff --to gemini $ref"
+  print
+  print -r -- "Export:"
+  print -r -- "asm export --to portable $ref"
+  if [[ -n "$jira_key" ]]; then
+    print
+    print -r -- "Jira:"
+    print -r -- "asm jira view $jira_key"
+    print -r -- "asm jira open $jira_key"
+  fi
+}
+
+picker_preview_ref() {
+  local ref="$1"
+  local preview_mode
+  preview_mode="$(normalize_picker_preview_mode "${2:-overview}")"
+  local cache_file="${ASM_CACHE_FILE:-}"
+  [[ -n "$cache_file" && -f "$cache_file" ]] || return 0
+
+  local rec
+  rec="$(record_for_ref "$cache_file" "$ref")"
+  [[ -n "$rec" ]] || return 0
+
+  print -r -- "Preview:      $preview_mode"
+  print
+  print_picker_preview_summary "$rec"
+  print
+  case "$preview_mode" in
+    transcript)
+      print -r -- "Transcript:"
+      print_recent_preview "$rec"
+      ;;
+    commands)
+      print_picker_preview_commands "$cache_file" "$ref" "$rec"
+      ;;
+    *)
+      print -r -- "Overview:"
+      print -r -- "Picker preview is compact. Press 2 for transcript or 3 for commands."
+      ;;
+  esac
+  print
+  print -r -- "Preview Keys:"
+  print -r -- "1 overview | 2 transcript | 3 commands"
+  print -r -- "? shortcuts | f1 jump | [ ] tabs | / search | enter resume | v menu"
+  print -r -- "i inspect | h choose handoff | l last target | m move | n new-tab | u untab"
+  print -r -- "a alias | y copy | o cd | c clone | r refresh"
+}
+
+preview_ref() {
+  local ref="$1"
+  local preview_mode
+  preview_mode="$(normalize_picker_preview_mode "${2:-overview}")"
+  local cache_file="${ASM_CACHE_FILE:-}"
+  [[ -n "$cache_file" && -f "$cache_file" ]] || return 0
+
+  local rec
+  rec="$(record_for_ref "$cache_file" "$ref")"
+  [[ -n "$rec" ]] || return 0
+
+  print -r -- "Preview:      $preview_mode"
+  print
+  print_session_preview_summary "$cache_file" "$ref" "$rec"
+  print
+  case "$preview_mode" in
+    transcript)
+      print -r -- "Transcript:"
+      print_recent_preview "$rec"
+      ;;
+    commands)
+      print_session_preview_commands "$cache_file" "$ref" "$rec"
+      ;;
+    *)
+      print_session_preview_block "$rec"
+      ;;
+  esac
+  print
+  print -r -- "Preview Keys:"
+  print -r -- "1 overview | 2 transcript | 3 commands"
+  print -r -- "? shortcuts | f1 jump | [ ] tabs | / search | enter resume | v menu"
+  print -r -- "i inspect | h choose handoff | l last target | m move | n new-tab | u untab"
+  print -r -- "a alias | y copy | o cd | c clone | r refresh"
 }
 
 prompt_alias() {
@@ -3146,6 +4203,40 @@ prompt_alias() {
   fi
 }
 
+picker_char_action_bind() {
+  local key="$1"
+  local normal_action="$2"
+  printf "%s:transform:if [[ \"\$FZF_INPUT_STATE\" = \"enabled\" ]]; then echo 'put(%s)'; else echo '%s'; fi" \
+    "$key" "$key" "$normal_action"
+}
+
+picker_char_accept_bind() {
+  local key="$1"
+  printf "%s:transform:if [[ \"\$FZF_INPUT_STATE\" = \"enabled\" ]]; then echo 'put(%s)'; else echo 'print(%s)+accept'; fi" \
+    "$key" "$key" "$key"
+}
+
+picker_trailing_action_key() {
+  case "${1:-}" in
+    /|\?|t|a|y|o|c|h|l|i|m|n|u|1|2|3|p|v|'['|']'|r)
+      print -r -- "$1"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+picker_search_mode_bind_action() {
+  local action="${1:-unbind}"
+  local key out=""
+  for key in '?' t a y o c h l i m n u 1 2 3 p v '[' ']' r; do
+    out+="+${action}(${key})"
+  done
+  print -r -- "${out#+}"
+}
+
 pick_ref_interactive() {
   local query="${1:-}"
   local mode="${2:-action}"
@@ -3153,72 +4244,128 @@ pick_ref_interactive() {
   cache_file="$(mktemp)"
   state_file="$(mktemp)"
   build_cache >"$cache_file"
+  [[ -n "$query" ]] && apply_query_ranking_to_cache_file "$cache_file" "$query"
   picker_state_write "$state_file" "session"
   debug_log "picker open mode=$mode query=${query:-}"
 
-  local header key current_tab
-  current_tab="$(get_active_tab_name)"
-  set_active_tab_name "$current_tab"
+  local key picker_mode
+  local query_hint="live filter"
+  [[ -n "$query" ]] && query_hint="hybrid rank + live filter"
   while true; do
-    header="$(ASM_FORCE_COLOR=1 command asm __picker_header $(shell_quote "$cache_file") $(shell_quote "$state_file"))"
-    local render_cmd pin_cmd refresh_cmd shift_left_cmd shift_right_cmd header_cmd prompt_cmd tab_target_cmd back_mode_cmd
-    render_cmd="ASM_FORCE_COLOR=1 command asm __render_picker_rows $(shell_quote "$cache_file") $(shell_quote "$state_file")"
+    picker_mode="$(picker_state_mode "$state_file")"
+    local render_cmd pin_cmd refresh_cmd preview_window picker_columns
+    render_cmd="ASM_FORCE_COLOR=1 ASM_PICKER_QUERY_HINT=$(shell_quote "$query_hint") command asm __render_picker_rows $(shell_quote "$cache_file") $(shell_quote "$state_file") {q}"
     pin_cmd="command asm __toggle_pin_cache $(shell_quote "$cache_file") {+1}"
     refresh_cmd="command asm __refresh_cache $(shell_quote "$cache_file")"
-    shift_left_cmd="command asm __picker_shift_active_tab $(shell_quote "$state_file") left"
-    shift_right_cmd="command asm __picker_shift_active_tab $(shell_quote "$state_file") right"
-    header_cmd="ASM_FORCE_COLOR=1 command asm __picker_header $(shell_quote "$cache_file") $(shell_quote "$state_file")"
-    prompt_cmd="command asm __picker_prompt $(shell_quote "$state_file")"
-    tab_target_cmd="command asm __picker_enter_tab_target $(shell_quote "$state_file") {+1}"
-    back_mode_cmd="command asm __picker_leave_mode $(shell_quote "$state_file")"
+    picker_columns="$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || print 0)"
+    if [[ "$picker_columns" == <-> ]] && (( picker_columns > 0 && picker_columns < 150 )); then
+      preview_window='down:55%,border-top,wrap'
+    else
+      preview_window='right:60%,border-left,wrap'
+    fi
+    local normal_prompt search_bind esc_bind search_mode_bind normal_mode_bind
+    normal_prompt="$(cmd_prompt_text)"
+    search_mode_bind="$(picker_search_mode_bind_action unbind)"
+    normal_mode_bind="$(picker_search_mode_bind_action rebind)"
+    search_bind='/:transform:if [[ "$FZF_INPUT_STATE" = "enabled" ]]; then echo ignore; else echo "show-input+change-prompt(search> )+change-preview-window(hidden)+'"$search_mode_bind"'+reload('"$render_cmd"')"; fi'
+    esc_bind="esc:transform:if [[ \"\$FZF_INPUT_STATE\" = \"enabled\" ]]; then echo 'hide-input+clear-query+change-prompt(${normal_prompt})+change-preview-window(${preview_window})+${normal_mode_bind}+reload(ASM_FORCE_COLOR=1 ASM_PICKER_QUERY_HINT=$(shell_quote "$query_hint") command asm __render_picker_rows $(shell_quote "$cache_file") $(shell_quote "$state_file"))'; else echo abort; fi"
+    local bind_help bind_preview_1 bind_preview_2 bind_preview_3 bind_pin bind_tab_left bind_tab_right bind_refresh
+    local bind_tag bind_alias bind_copy bind_cd bind_clone bind_handoff bind_last_handoff bind_inspect bind_move bind_new_tab bind_untab bind_revive
+    bind_help="$(picker_char_accept_bind '?')"
+    bind_preview_1="$(picker_char_action_bind '1' "execute-silent(command asm __picker_set_preview_mode $(shell_quote "$state_file") overview)+reload($render_cmd)")"
+    bind_preview_2="$(picker_char_action_bind '2' "execute-silent(command asm __picker_set_preview_mode $(shell_quote "$state_file") transcript)+reload($render_cmd)")"
+    bind_preview_3="$(picker_char_action_bind '3' "execute-silent(command asm __picker_set_preview_mode $(shell_quote "$state_file") commands)+reload($render_cmd)")"
+    bind_pin="$(picker_char_action_bind 'p' "execute-silent($pin_cmd)+reload($render_cmd)")"
+    bind_tab_left="$(picker_char_action_bind '[' "execute-silent(command asm __picker_shift_active_tab $(shell_quote "$state_file") left)+reload($render_cmd)")"
+    bind_tab_right="$(picker_char_action_bind ']' "execute-silent(command asm __picker_shift_active_tab $(shell_quote "$state_file") right)+reload($render_cmd)")"
+    bind_refresh="$(picker_char_action_bind 'r' "execute-silent($refresh_cmd)+reload($render_cmd)")"
+    bind_tag="$(picker_char_accept_bind 't')"
+    bind_alias="$(picker_char_accept_bind 'a')"
+    bind_copy="$(picker_char_accept_bind 'y')"
+    bind_cd="$(picker_char_accept_bind 'o')"
+    bind_clone="$(picker_char_accept_bind 'c')"
+    bind_handoff="$(picker_char_accept_bind 'h')"
+    bind_last_handoff="$(picker_char_accept_bind 'l')"
+    bind_inspect="$(picker_char_accept_bind 'i')"
+    bind_move="$(picker_char_accept_bind 'm')"
+    bind_new_tab="$(picker_char_accept_bind 'n')"
+    bind_untab="$(picker_char_accept_bind 'u')"
+    bind_revive="$(picker_char_action_bind 'v' "execute-silent(command asm __picker_enter_revive $(shell_quote "$state_file") {1})+change-prompt(revive> )+reload($render_cmd)")"
     local selection
+    local -a fzf_opts
+    fzf_opts=(
+      --height=100%
+      --layout=reverse
+      --border
+      --ansi
+      --multi
+      --info=inline-right
+      --border-label=' sessions '
+      --preview-label=' preview '
+      --delimiter=$'\t'
+      --nth=2
+      --with-nth=3..
+      --header-lines=3
+      --header-first
+      --header-lines-border=bottom
+      --header-label=' status '
+      --header-label-pos=2
+      --tiebreak=index
+      --bind "change:reload($render_cmd)"
+      --bind "shift-up:toggle+up"
+      --bind "shift-down:toggle+down"
+      --bind "f1:jump"
+      --bind "$search_bind"
+      --bind "$esc_bind"
+      --bind 'pgup:preview-page-up,pgdn:preview-page-down'
+      --track
+      --preview "command asm __picker_preview $(shell_quote "$cache_file") $(shell_quote "$state_file") {1} 2>/dev/null || true"
+      --preview-window="$preview_window"
+      --prompt "$normal_prompt"
+      --no-input
+      --disabled
+    )
+
+    fzf_opts+=(
+      --expect=enter,ctrl-t,alt-a,ctrl-y,ctrl-o,alt-c
+      --bind "$bind_help"
+      --bind "$bind_preview_1"
+      --bind "$bind_preview_2"
+      --bind "$bind_preview_3"
+      --bind "$bind_pin"
+      --bind "ctrl-p:execute-silent($pin_cmd)+reload($render_cmd)"
+      --bind "$bind_tab_left"
+      --bind "$bind_tab_right"
+      --bind "$bind_refresh"
+      --bind "ctrl-r:execute-silent($refresh_cmd)+reload($render_cmd)"
+      --bind "$bind_tag"
+      --bind "$bind_alias"
+      --bind "$bind_copy"
+      --bind "$bind_cd"
+      --bind "$bind_clone"
+      --bind "$bind_handoff"
+      --bind "$bind_last_handoff"
+      --bind "$bind_inspect"
+      --bind "$bind_move"
+      --bind "$bind_new_tab"
+      --bind "$bind_untab"
+      --bind "$bind_revive"
+    )
+    [[ -n "$query" ]] && fzf_opts+=( --bind "start:show-input+change-prompt(search> )+change-preview-window(hidden)+${search_mode_bind}+reload($render_cmd)" -q "$query" )
+
     selection="$(
-      ASM_FORCE_COLOR=1 render_picker_rows "$cache_file" "$state_file" \
-        | ASM_CACHE_FILE="$cache_file" ASM_FORCE_COLOR=1 fzf \
-            --height=100% \
-            --layout=reverse \
-            --border \
-            --ansi \
-            --multi \
-            --info=inline-right \
-            --delimiter=$'\t' \
-            --with-nth=2.. \
-            --expect=esc,enter,ctrl-t,ctrl-n,alt-s,alt-w,alt-i,alt-a,ctrl-y,ctrl-o,alt-c,alt-h \
-            --bind "ctrl-p:execute-silent($pin_cmd)+reload($render_cmd)" \
-            --bind "ctrl-r:execute-silent($refresh_cmd)+reload($render_cmd)" \
-            --bind "shift-up:toggle+up" \
-            --bind "shift-down:toggle+down" \
-            --bind "tab:execute-silent($tab_target_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)+refresh-preview" \
-            --bind "alt-m:execute-silent($tab_target_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)+refresh-preview" \
-            --bind "btab:execute-silent($back_mode_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)+refresh-preview" \
-            --bind "left:execute-silent($shift_left_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)" \
-            --bind "right:execute-silent($shift_right_cmd)+reload($render_cmd)+transform-header($header_cmd)+transform-prompt($prompt_cmd)" \
-            --bind='pgup:preview-page-up,pgdn:preview-page-down' \
-            --track \
-            --preview "command asm __picker_preview $(shell_quote "$cache_file") $(shell_quote "$state_file") {1} 2>/dev/null || true" \
-            --preview-window='right:60%,border-left,wrap' \
-            --header "$header" \
-            --prompt="$(cmd_picker_prompt "$state_file")" \
-            ${query:+-q "$query"}
+      ASM_PICKER_QUERY_HINT="$query_hint" ASM_FORCE_COLOR=1 render_picker_rows "$cache_file" "$state_file" \
+        | ASM_CACHE_FILE="$cache_file" ASM_FORCE_COLOR=1 fzf "${fzf_opts[@]}"
     )" || {
       rm -f "$cache_file"
       rm -f "$state_file"
       return 1
     }
 
-    local picker_mode selection_lines refs session_refs ref primary_ref
+    local selection_lines refs session_refs ref primary_ref
     picker_mode="$(picker_state_mode "$state_file")"
     selection_lines=("${(@f)selection}")
     key="${selection_lines[1]}"
-    if [[ "$key" == "esc" ]]; then
-      if [[ "$picker_mode" == "tab-target" ]]; then
-        picker_state_write "$state_file" "session"
-        current_tab="$(get_active_tab_name)"
-        continue
-      fi
-      rm -f "$cache_file" "$state_file"
-      return 1
-    fi
     if [[ -z "$key" || "$key" == *$'\t'* ]]; then
       key=""
       refs=()
@@ -3235,122 +4382,130 @@ pick_ref_interactive() {
         refs+=("${entry%%$'\t'*}")
       done
     fi
+    if [[ "$picker_mode" == "revive" ]]; then
+      local action_ref action source_ref revive_rc
+      action_ref="${refs[1]:-}"
+      if [[ "$action_ref" == __revive__:* ]]; then
+        action="${action_ref#__revive__:}"
+        source_ref="$(picker_state_primary_ref "$state_file")"
+        if [[ "$action" == "back" ]]; then
+          picker_state_write "$state_file" "session"
+          continue
+        fi
+        handle_revive_action "$cache_file" "$source_ref" "$action"
+        revive_rc=$?
+        if [[ "$revive_rc" -eq 0 ]]; then
+          rm -f "$cache_file"
+          rm -f "$state_file"
+          return 0
+        fi
+        picker_state_write "$state_file" "session"
+        [[ "$action" == "export" || "$action" == "copy" ]] && continue
+      fi
+      picker_state_write "$state_file" "session"
+      continue
+    fi
+    if [[ -z "$key" && ${#refs[@]} -gt 0 ]]; then
+      key="$(picker_trailing_action_key "${refs[-1]}")" || key=""
+      if [[ -n "$key" ]]; then
+        unset 'refs[-1]'
+      fi
+    fi
     if [[ ${#refs[@]} -eq 0 ]]; then
       debug_log "picker key=$key with no refs; waiting for next stable selection"
-      current_tab="$(get_active_tab_name)"
       continue
     fi
     session_refs=()
     local picked
     for picked in "${refs[@]}"; do
-      session_refs+=("$picked")
+      if ref_exists_in_cache "$cache_file" "$picked"; then
+        session_refs+=("$picked")
+      elif [[ -n "$picked" ]]; then
+        debug_log "picker dropped invalid ref entry=$picked key=$key"
+      fi
     done
+    if [[ ${#session_refs[@]} -eq 0 ]]; then
+      debug_log "picker key=$key with only invalid refs; waiting for next stable selection"
+      continue
+    fi
+    refs=("${session_refs[@]}")
     primary_ref="${refs[1]}"
     debug_log "picker key=$key refs=${(j:,:)refs} mode=$mode"
-    current_tab="$(get_active_tab_name)"
 
     case "$key" in
+      \?)
+        show_picker_shortcuts
+        continue
+        ;;
       enter|'')
-        if [[ "$picker_mode" == "tab-target" ]]; then
-          local target_ref target_tab
-          session_refs=("${(@f)$(picker_state_refs "$state_file")}")
-          target_ref="$primary_ref"
-          case "$target_ref" in
-            __tab_target__:__pin_on__)
-              set_pin_in_cache "$cache_file" 1 "${session_refs[@]}"
-              ;;
-            __tab_target__:__pin_off__)
-              set_pin_in_cache "$cache_file" 0 "${session_refs[@]}"
-              ;;
-            __tab_target__:All)
-              remove_ref_from_cache_tab "$cache_file" "${session_refs[@]}"
-              ;;
-            __tab_target__:+new)
-              target_tab="$(prompt_tab_name)"
-              [[ -n "$target_tab" ]] && assign_ref_to_cache_tab "$cache_file" "$target_tab" "${session_refs[@]}"
-              ;;
-            __tab_target__:* )
-              target_tab="${target_ref#__tab_target__:}"
-              assign_ref_to_cache_tab "$cache_file" "$target_tab" "${session_refs[@]}"
-              ;;
-          esac
-          picker_state_write "$state_file" "session"
-          current_tab="$(get_active_tab_name)"
-          continue
-        fi
         if [[ "$mode" == "select" ]]; then
           print -r -- "$primary_ref"
           rm -f "$cache_file"
           rm -f "$state_file"
           return 0
         fi
-        if [[ -n "${ASM_CMD_FILE:-}" ]]; then
-          emit_shell_cmd "ASM_CMD_FILE=$(shell_quote "$ASM_CMD_FILE") command asm revive $(shell_quote "$primary_ref")"
-          rm -f "$cache_file"
-          rm -f "$state_file"
-          return 0
-        fi
-        if revive_session_flow "$cache_file" "$primary_ref"; then
-          rm -f "$cache_file"
-          rm -f "$state_file"
-          return 0
-        fi
+        maybe_prepare_claude_launch_for_ref "$cache_file" "$primary_ref"
+        update_last_opened "$primary_ref"
+        emit_shell_cmd "command asm resume $(shell_quote "$primary_ref")"
+        rm -f "$cache_file"
+        rm -f "$state_file"
+        return 0
         ;;
-      ctrl-t)
+      t|ctrl-t)
         tag_ref_interactive "$cache_file" "$primary_ref"
-        current_tab="$(get_active_tab_name)"
         ;;
-      ctrl-n)
-        local new_tab_name
-        new_tab_name="$(prompt_tab_name)"
-        [[ -n "$new_tab_name" ]] || continue
-        assign_ref_to_cache_tab "$cache_file" "$new_tab_name" "${session_refs[@]}"
-        current_tab="$new_tab_name"
-        set_active_tab_name "$current_tab"
+      m)
+        move_refs_to_tab_interactive "$cache_file" "${refs[@]}"
+        continue
         ;;
-      alt-s)
-        if [[ "$current_tab" == "All" ]]; then
-          notice "summon tab works on a custom tab, not All"
-          continue
+      n)
+        create_new_tab_for_refs_interactive "$cache_file" "${refs[@]}"
+        continue
+        ;;
+      u)
+        remove_ref_from_cache_tab "$cache_file" "${refs[@]}"
+        continue
+        ;;
+      v)
+        if [[ "$mode" == "select" ]]; then
+          print -r -- "$primary_ref"
+          rm -f "$cache_file"
+          rm -f "$state_file"
+          return 0
         fi
-        emit_shell_cmd "command asm __summon_tab $(shell_quote "$current_tab") tab"
+        picker_state_write "$state_file" "revive" "$primary_ref"
+        continue
+        ;;
+      i)
+        if [[ "$mode" == "select" ]]; then
+          print -r -- "$primary_ref"
+          rm -f "$cache_file"
+          rm -f "$state_file"
+          return 0
+        fi
+        emit_shell_cmd "command asm inspect $(shell_quote "$primary_ref")"
         rm -f "$cache_file"
         rm -f "$state_file"
         return 0
         ;;
-      alt-w)
-        if [[ "$current_tab" == "All" ]]; then
-          notice "summon window works on a custom tab, not All"
-          continue
-        fi
-        emit_shell_cmd "command asm __summon_tab $(shell_quote "$current_tab") window"
-        rm -f "$cache_file"
-        rm -f "$state_file"
-        return 0
-        ;;
-      alt-i)
-        import_current_iterm_tabs
-        refresh_cache_file "$cache_file"
-        current_tab="$(get_active_tab_name)"
-        ;;
-      alt-a)
+      a|alt-a)
         local current_alias next_alias
         current_alias="$(field_for_ref "$cache_file" "$primary_ref" "alias")"
         next_alias="$(prompt_alias "$current_alias")"
         set_alias_for_ref "$primary_ref" "$next_alias"
         build_cache >"$cache_file"
         ;;
-      ctrl-y)
+      y|ctrl-y)
         copy_to_clipboard "${(j:$'\n':)refs}"
         notice "copied: ${#refs[@]} ref(s)"
         ;;
-      ctrl-o)
+      o|ctrl-o)
         emit_shell_cmd "cd $(shell_quote "$(resolve_cwd "${primary_ref%%:*}" "${primary_ref#*:}" "$(field_for_ref "$cache_file" "$primary_ref" "cwd")")")"
         rm -f "$cache_file"
         rm -f "$state_file"
         return 0
         ;;
-      alt-c)
+      c|alt-c)
         local clone_cmd
         clone_cmd="$(clone_command_for_ref "$cache_file" "$primary_ref")" || {
           notice "clone is not available for ${primary_ref%%:*}"
@@ -3362,17 +4517,20 @@ pick_ref_interactive() {
         rm -f "$state_file"
         return 0
         ;;
-      alt-h)
-        local target_agent handoff_cmd
-        target_agent="$(choose_handoff_target)" || continue
-        handoff_cmd="$(handoff_command_for_ref "$cache_file" "$primary_ref" "$target_agent")" || {
-          notice "handoff is available to codex, claude, or gemini"
-          continue
-        }
-        emit_shell_cmd "$handoff_cmd"
+      h)
+        emit_handoff_for_ref "$cache_file" "$primary_ref" choose || continue
         rm -f "$cache_file"
         rm -f "$state_file"
         return 0
+        ;;
+      l)
+        emit_handoff_for_ref "$cache_file" "$primary_ref" last || continue
+        rm -f "$cache_file"
+        rm -f "$state_file"
+        return 0
+        ;;
+      r)
+        refresh_cache_file "$cache_file"
         ;;
       *)
         ;;
@@ -3381,19 +4539,568 @@ pick_ref_interactive() {
 }
 
 resolve_ref_argument() {
-  if [[ $# -gt 0 && "$1" == *:* ]]; then
-    print -r -- "$1"
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == *:* ]]; then
+      print -r -- "$1"
+      return 0
+    fi
+    if [[ "$1" == <-> ]]; then
+      local selector="$1"
+      local ref
+      if [[ -f "$ASM_LAST_LIST_FILE" ]]; then
+        ref="$(sed -n "${selector}p" "$ASM_LAST_LIST_FILE" 2>/dev/null || true)"
+        [[ -n "$ref" ]] || {
+          print -u2 -- "list selection out of range: $selector"
+          return 1
+        }
+        print -r -- "$ref"
+        return 0
+      fi
+      print -u2 -- "no recent list results; run 'asm list' first"
+      return 1
+    fi
+  fi
+  pick_ref_interactive "$*" select
+}
+
+write_last_list_refs() {
+  local cache_file="$1"
+  local limit="${2:-20}"
+  local target_file="${3:-$ASM_LAST_LIST_FILE}"
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  if (( limit <= 0 )); then
+    jq -r '.[].ref' "$cache_file" >"$tmp_file"
   else
-    pick_ref_interactive "$*" select
+    jq -r --argjson limit "$limit" '.[:$limit][] | .ref' "$cache_file" >"$tmp_file"
+  fi
+
+  mv "$tmp_file" "$target_file"
+}
+
+normalize_jira_site() {
+  local site="${ASM_JIRA_SITE:-}"
+  [[ -n "$site" ]] || return 1
+  if [[ "$site" != http://* && "$site" != https://* ]]; then
+    site="https://$site"
+  fi
+  print -r -- "${site%/}"
+}
+
+load_jira_config() {
+  [[ -f "$ASM_JIRA_CONFIG_FILE" ]] || return 0
+  command_exists jq || return 0
+
+  local site email token mine_jql max_issues
+  site="$(jq -r '.site // empty' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || true)"
+  email="$(jq -r '.email // empty' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || true)"
+  token="$(jq -r '.api_token // empty' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || true)"
+  mine_jql="$(jq -r '.mine_jql // empty' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || true)"
+  max_issues="$(jq -r '.max_issues // empty' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || true)"
+
+  [[ -n "${ASM_JIRA_SITE:-}" ]] || export ASM_JIRA_SITE="$site"
+  [[ -n "${ASM_JIRA_EMAIL:-}" ]] || export ASM_JIRA_EMAIL="$email"
+  [[ -n "${ASM_JIRA_API_TOKEN:-}" ]] || export ASM_JIRA_API_TOKEN="$token"
+  [[ -n "${ASM_JIRA_MINE_JQL:-}" ]] || [[ -z "$mine_jql" ]] || export ASM_JIRA_MINE_JQL="$mine_jql"
+  [[ -n "${ASM_JIRA_MAX_ISSUES:-}" ]] || [[ -z "$max_issues" ]] || export ASM_JIRA_MAX_ISSUES="$max_issues"
+}
+
+write_jira_config() {
+  local site="$1"
+  local email="$2"
+  local token="$3"
+  local mine_jql="${4:-}"
+  local max_issues="${5:-}"
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  jq -n \
+    --arg site "$site" \
+    --arg email "$email" \
+    --arg token "$token" \
+    --arg mine_jql "$mine_jql" \
+    --arg max_issues "$max_issues" '
+      {
+        site: $site,
+        email: $email,
+        api_token: $token
+      }
+      + (if $mine_jql != "" then {mine_jql: $mine_jql} else {} end)
+      + (if $max_issues != "" then {max_issues: $max_issues} else {} end)
+    ' >"$tmp_file"
+
+  mv "$tmp_file" "$ASM_JIRA_CONFIG_FILE"
+  chmod 600 "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || true
+}
+
+jira_require_config() {
+  local -a missing=()
+  [[ -n "${ASM_JIRA_SITE:-}" ]] || missing+=("ASM_JIRA_SITE")
+  [[ -n "${ASM_JIRA_EMAIL:-}" ]] || missing+=("ASM_JIRA_EMAIL")
+  [[ -n "${ASM_JIRA_API_TOKEN:-}" ]] || missing+=("ASM_JIRA_API_TOKEN")
+  if (( ${#missing[@]} > 0 )); then
+    print -u2 -- "jira config missing: ${(@j:, :)missing}"
+    return 1
+  fi
+  command_exists curl || {
+    print -u2 -- "curl is required for jira commands"
+    return 1
+  }
+}
+
+jira_issue_url() {
+  local issue_key="$1"
+  local site
+  site="$(normalize_jira_site)" || return 1
+  print -r -- "${site}/browse/${issue_key}"
+}
+
+jira_search_my_issues_json() {
+  jira_require_config || return 1
+  local site
+  site="$(normalize_jira_site)" || return 1
+  curl --silent --show-error --fail --get \
+    -u "${ASM_JIRA_EMAIL}:${ASM_JIRA_API_TOKEN}" \
+    -H 'Accept: application/json' \
+    --data-urlencode "jql=${ASM_JIRA_MINE_JQL:-assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC}" \
+    --data-urlencode "maxResults=${ASM_JIRA_MAX_ISSUES:-20}" \
+    --data-urlencode "fields=summary,status,priority,assignee,updated,issuetype,parent" \
+    "${site}/rest/api/3/search"
+}
+
+jira_fetch_issue_json() {
+  local issue_key="$1"
+  jira_require_config || return 1
+  local site
+  site="$(normalize_jira_site)" || return 1
+  curl --silent --show-error --fail --get \
+    -u "${ASM_JIRA_EMAIL}:${ASM_JIRA_API_TOKEN}" \
+    -H 'Accept: application/json' \
+    --data-urlencode "fields=summary,status,priority,assignee,updated,issuetype,parent" \
+    "${site}/rest/api/3/issue/${issue_key}"
+}
+
+write_jira_last_issues() {
+  local raw_json="$1"
+  local target_file="${2:-$ASM_JIRA_LAST_FILE}"
+  local site tmp_file
+  site="$(normalize_jira_site)" || return 1
+  tmp_file="$(mktemp)"
+  jq --arg site "$site" '
+    [
+      .issues[]? | {
+        key: .key,
+        summary: (.fields.summary // ""),
+        status: (.fields.status.name // "-"),
+        priority: (.fields.priority.name // "-"),
+        assignee: (.fields.assignee.displayName // "-"),
+        updated: (.fields.updated // ""),
+        issue_type: (.fields.issuetype.name // "-"),
+        parent_key: (.fields.parent.key // ""),
+        parent_summary: (.fields.parent.fields.summary // ""),
+        url: ($site + "/browse/" + .key)
+      }
+    ]
+  ' <<<"$raw_json" >"$tmp_file"
+  mv "$tmp_file" "$target_file"
+}
+
+resolve_jira_issue_selector() {
+  local selector="${1:-}"
+  [[ -n "$selector" ]] || {
+    print -u2 -- "usage: asm jira view <N|ISSUE-KEY>"
+    return 1
+  }
+  if [[ "$selector" == <-> ]]; then
+    [[ -f "$ASM_JIRA_LAST_FILE" ]] || {
+      print -u2 -- "no recent jira results; run 'asm jira mine' first"
+      return 1
+    }
+    local idx key
+    idx=$(( selector - 1 ))
+    key="$(jq -r --argjson idx "$idx" '.[$idx].key // empty' "$ASM_JIRA_LAST_FILE" 2>/dev/null || true)"
+    [[ -n "$key" ]] || {
+      print -u2 -- "jira selection out of range: $selector"
+      return 1
+    }
+    print -r -- "$key"
+    return 0
+  fi
+  print -r -- "$selector"
+}
+
+find_asm_config_file() {
+  local dir="${PWD:A}"
+  while true; do
+    if [[ -f "$dir/asm.json" ]]; then
+      print -r -- "$dir/asm.json"
+      return 0
+    fi
+    if [[ -f "$dir/.asm.json" ]]; then
+      print -r -- "$dir/.asm.json"
+      return 0
+    fi
+    if [[ "$dir" == "/" || "$dir" == "$HOME" ]]; then
+      break
+    fi
+    dir="${dir:h}"
+  done
+  return 1
+}
+
+preset_exists_in_config() {
+  local config_file="$1"
+  local preset_name="$2"
+  jq -e --arg preset "$preset_name" '.presets[$preset] != null' "$config_file" >/dev/null 2>&1
+}
+
+preset_names_in_config() {
+  local config_file="$1"
+  jq -r '
+    (.presets // {})
+    | keys[]
+  ' "$config_file"
+}
+
+preset_entries_for_name() {
+  local config_file="$1"
+  local preset_name="$2"
+  jq -r --arg preset "$preset_name" '
+    .presets[$preset] as $preset_value
+    | if $preset_value == null then
+        empty
+      elif ($preset_value | type) == "array" then
+        $preset_value[]
+      elif ($preset_value | type) == "object" then
+        ($preset_value.sessions // [])[]
+      else
+        empty
+      end
+  ' "$config_file"
+}
+
+preset_title_for_name() {
+  local config_file="$1"
+  local preset_name="$2"
+  jq -r --arg preset "$preset_name" '
+    .presets[$preset] as $preset_value
+    | if $preset_value == null then
+        empty
+      elif ($preset_value | type) == "object" then
+        ($preset_value.title // "")
+      else
+        ""
+      end
+  ' "$config_file"
+}
+
+preset_cwd_for_name() {
+  local config_file="$1"
+  local preset_name="$2"
+  local config_dir raw_cwd
+  config_dir="${config_file:h}"
+  raw_cwd="$(
+    jq -r --arg preset "$preset_name" '
+      .presets[$preset] as $preset_value
+      | if $preset_value == null then
+          empty
+        elif ($preset_value | type) == "object" then
+          ($preset_value.cwd // "")
+        else
+          ""
+        end
+    ' "$config_file"
+  )"
+  [[ -n "$raw_cwd" ]] || return 0
+  if [[ "$raw_cwd" == /* ]]; then
+    print -r -- "$raw_cwd"
+  else
+    print -r -- "${config_dir:A}/$raw_cwd"
   fi
 }
 
+preset_open_mode_for_name() {
+  local config_file="$1"
+  local preset_name="$2"
+  jq -r --arg preset "$preset_name" '
+    .presets[$preset] as $preset_value
+    | if $preset_value == null then
+        empty
+      elif ($preset_value | type) == "object" then
+        ($preset_value.open // $preset_value.mode // .defaultOpen // "")
+      else
+        (.defaultOpen // "")
+      end
+  ' "$config_file"
+}
+
+latest_ref_for_agent() {
+  local cache_file="$1"
+  local agent="$2"
+  local target_cwd="${3:-}"
+  local first_ref=""
+  local scoped_ref=""
+  local ref cwd
+  while IFS=$'\t' read -r ref cwd; do
+    [[ -n "$ref" ]] || continue
+    [[ -n "$first_ref" ]] || first_ref="$ref"
+    if [[ -n "$target_cwd" ]] && [[ "$cwd" == "$target_cwd" || "$cwd" == "$target_cwd"/* ]]; then
+      scoped_ref="$ref"
+      break
+    fi
+  done < <(
+    jq -r --arg agent "$agent" '
+      .[]
+      | select(.agent == $agent)
+      | [.ref, (.cwd // "")]
+      | @tsv
+    ' "$cache_file"
+  )
+
+  if [[ -n "$scoped_ref" ]]; then
+    print -r -- "$scoped_ref"
+    return 0
+  fi
+  [[ -n "$first_ref" ]] && print -r -- "$first_ref"
+}
+
+resolve_preset_entry() {
+  local cache_file="$1"
+  local entry="$2"
+  local target_cwd="${3:-}"
+
+  if [[ "$entry" == *:latest ]]; then
+    local agent ref
+    agent="${entry%%:*}"
+    ref="$(latest_ref_for_agent "$cache_file" "$agent" "$target_cwd")"
+    [[ -n "$ref" ]] || {
+      print -u2 -- "no session found for preset entry: $entry"
+      return 1
+    }
+    print -r -- "$ref"
+    return 0
+  fi
+
+  if [[ "$entry" == *:* ]]; then
+    local rec
+    rec="$(record_for_ref "$cache_file" "$entry")"
+    [[ -n "$rec" ]] || {
+      print -u2 -- "session not found for preset entry: $entry"
+      return 1
+    }
+    print -r -- "$entry"
+    return 0
+  fi
+
+  print -u2 -- "unsupported preset entry: $entry"
+  return 1
+}
+
+open_command_for_ref() {
+  local cache_file="$1"
+  local ref="$2"
+  local mode="$3"
+  local override_cwd="${4:-}"
+  local resume_cmd agent session_id resolved_cwd cached_cwd
+  agent="${ref%%:*}"
+  session_id="${ref#*:}"
+  if [[ -n "$override_cwd" ]]; then
+    resolved_cwd="$override_cwd"
+  else
+    cached_cwd="$(field_for_ref "$cache_file" "$ref" "cwd")"
+    resolved_cwd="$(resolve_cwd "$agent" "$session_id" "$cached_cwd")"
+  fi
+  resume_cmd="$(resume_command_for_agent_session "$agent" "$session_id" "$resolved_cwd")" || return 1
+
+  case "$mode" in
+    resume)
+      print -r -- "$resume_cmd"
+      ;;
+    tab)
+      print -r -- "command asm __iterm_tab $(shell_quote "$resume_cmd")"
+      ;;
+    window)
+      print -r -- "command asm __iterm_window $(shell_quote "$resume_cmd")"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 print_list() {
+  local limit=20
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--all) limit=0; shift ;;
+      -n) limit="${2:-20}"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
   local cache_file
   cache_file="$(mktemp)"
   build_cache >"$cache_file"
-  render_lines "$cache_file"
+  write_last_list_refs "$cache_file" "$limit"
+  run_runtime_py render-list "$cache_file" "$ASM_NOW_EPOCH" "$limit"
   rm -f "$cache_file"
+}
+
+cmd_jira() {
+  local action="${1:-mine}"
+  shift || true
+
+  case "$action" in
+    config)
+      local config_action="${1:-show}"
+      shift || true
+      case "$config_action" in
+        show)
+          load_jira_config
+          local cfg_site="${ASM_JIRA_SITE:-"-"}"
+          local cfg_email="${ASM_JIRA_EMAIL:-"-"}"
+          local cfg_token_state="[missing]"
+          local cfg_jql="${ASM_JIRA_MINE_JQL:-assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC}"
+          local cfg_max_issues="${ASM_JIRA_MAX_ISSUES:-20}"
+          if [[ -f "$ASM_JIRA_CONFIG_FILE" ]]; then
+            cfg_site="$(jq -r '.site // "-" ' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || print -r -- "${cfg_site}")"
+            cfg_email="$(jq -r '.email // "-" ' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || print -r -- "${cfg_email}")"
+            cfg_jql="$(jq -r '.mine_jql // "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || print -r -- "${cfg_jql}")"
+            cfg_max_issues="$(jq -r '.max_issues // "20"' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || print -r -- "${cfg_max_issues}")"
+            if [[ "$(jq -r '.api_token // empty' "$ASM_JIRA_CONFIG_FILE" 2>/dev/null || true)" != "" ]]; then
+              cfg_token_state="[set]"
+            fi
+          elif [[ -n "${ASM_JIRA_API_TOKEN:-}" ]]; then
+            cfg_token_state="[set]"
+          fi
+          print -r -- "Jira config"
+          print -r -- "  file: $ASM_JIRA_CONFIG_FILE"
+          print -r -- "  site: ${cfg_site}"
+          print -r -- "  email: ${cfg_email}"
+          print -r -- "  api token: ${cfg_token_state}"
+          print -r -- "  mine jql: ${cfg_jql}"
+          print -r -- "  max issues: ${cfg_max_issues}"
+          ;;
+        set)
+          load_jira_config
+          local site="${ASM_JIRA_SITE:-}"
+          local email="${ASM_JIRA_EMAIL:-}"
+          local token="${ASM_JIRA_API_TOKEN:-}"
+          local mine_jql="${ASM_JIRA_MINE_JQL:-}"
+          local max_issues="${ASM_JIRA_MAX_ISSUES:-20}"
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --site) site="${2:-}"; shift 2 ;;
+              --email) email="${2:-}"; shift 2 ;;
+              --token) token="${2:-}"; shift 2 ;;
+              --jql) mine_jql="${2:-}"; shift 2 ;;
+              --max-issues) max_issues="${2:-}"; shift 2 ;;
+              *)
+                print -u2 -- "usage: asm jira config set --site <url> --email <email> --token <token> [--jql <jql>] [--max-issues <n>]"
+                return 1
+                ;;
+            esac
+          done
+          [[ -n "$site" && -n "$email" && -n "$token" ]] || {
+            print -u2 -- "jira config set requires site, email, and token"
+            return 1
+          }
+          ASM_JIRA_SITE="$site"
+          site="$(normalize_jira_site)" || return 1
+          write_jira_config "$site" "$email" "$token" "$mine_jql" "$max_issues" || return 1
+          export ASM_JIRA_SITE="$site"
+          export ASM_JIRA_EMAIL="$email"
+          export ASM_JIRA_API_TOKEN="$token"
+          export ASM_JIRA_MINE_JQL="$mine_jql"
+          export ASM_JIRA_MAX_ISSUES="$max_issues"
+          print -r -- "saved jira config: $ASM_JIRA_CONFIG_FILE"
+          ;;
+        clear)
+          rm -f "$ASM_JIRA_CONFIG_FILE"
+          print -r -- "cleared jira config: $ASM_JIRA_CONFIG_FILE"
+          ;;
+        *)
+          print -u2 -- "usage: asm jira config [show|set|clear]"
+          return 1
+          ;;
+      esac
+      ;;
+    mine)
+      local raw_json
+      raw_json="$(jira_search_my_issues_json)" || return 1
+      write_jira_last_issues "$raw_json" || return 1
+
+      local total
+      total="$(jq -r 'length' "$ASM_JIRA_LAST_FILE" 2>/dev/null || print 0)"
+      if [[ "$total" == "0" ]]; then
+        print -r -- "No assigned Jira issues."
+        return 0
+      fi
+
+      print -r -- "Jira mine"
+      while IFS=$'\t' read -r idx key issue_status priority updated summary; do
+        local updated_short="${updated%%T*}"
+        printf '%3s. %-12s  %-16s  %-8s  %-10s  %s\n' \
+          "$idx" \
+          "$key" \
+          "$(truncate_text "$issue_status" 16)" \
+          "$(truncate_text "$priority" 8)" \
+          "${updated_short:-"-"}" \
+          "$(truncate_text "$summary" 90)"
+      done < <(
+        jq -r '
+          to_entries[]
+          | [(.key + 1), .value.key, .value.status, (.value.priority // "-"), .value.updated, .value.summary]
+          | @tsv
+        ' "$ASM_JIRA_LAST_FILE"
+      )
+      print
+      print -r -- "view with: asm jira view N | open with: asm jira open N"
+      ;;
+    view)
+      local selector issue_key raw_json issue_url
+      selector="${1:-}"
+      issue_key="$(resolve_jira_issue_selector "$selector")" || return 1
+      raw_json="$(jira_fetch_issue_json "$issue_key")" || return 1
+      issue_url="$(jira_issue_url "$issue_key")" || return 1
+
+      jq -r --arg url "$issue_url" '
+        [
+          "# " + (.key // "-") + " " + (.fields.summary // ""),
+          "",
+          "- Status: " + (.fields.status.name // "-"),
+          "- Priority: " + (.fields.priority.name // "-"),
+          "- Assignee: " + (.fields.assignee.displayName // "-"),
+          "- Type: " + (.fields.issuetype.name // "-"),
+          "- Updated: " + ((.fields.updated // "") | split("T")[0] // "-"),
+          (if (.fields.parent.key // "") != "" then
+             "- Parent: " + (.fields.parent.key // "") + " " + (.fields.parent.fields.summary // "")
+           else
+             empty
+           end),
+          "- URL: " + $url
+        ] | .[]
+      ' <<<"$raw_json"
+      ;;
+    open)
+      local selector issue_key issue_url
+      selector="${1:-}"
+      issue_key="$(resolve_jira_issue_selector "$selector")" || return 1
+      issue_url="$(jira_issue_url "$issue_key")" || return 1
+      if command_exists open; then
+        command open "$issue_url" >/dev/null 2>&1 || {
+          print -u2 -- "failed to open $issue_url"
+          return 1
+        }
+      fi
+      print -r -- "$issue_url"
+      ;;
+    *)
+      print -u2 -- "usage: asm jira [config [show|set|clear]|mine|view <N|ISSUE-KEY>|open <N|ISSUE-KEY>]"
+      return 1
+      ;;
+  esac
 }
 
 print_usage() {
@@ -3407,39 +5114,68 @@ Usage:
 
 Commands:
   help, -h, --help   Show this help
+  version            Show asm version
+  keys [--print]     Show keyboard shortcuts reference
   doctor             Check runtime dependencies and environment
+  smoke-test         Run fast normal-operation regression checks
+  index [init|update|status]
+  jira [mine|view <N|ISSUE-KEY>|open <N|ISSUE-KEY>]
   self-test          Run dev regression checks in an isolated temp HOME
   init [zsh|bash|fish]
   setup
-  list
-  resume <agent:session>
-  clone <agent:session>
+  status [--all] [--compact|--json]
+                     Show currently active agent sessions in iTerm
+  list [-a|--all] [-n N]
+  query <terms>
+  open [--list] [--print] <preset>
+  resume <agent:session|N>
+  clone <agent:session|N>
+  relate <child-agent:session|N> --parent <parent-agent:session|N> [--kind clone|handoff]
   handoff [--to codex|claude|gemini] [--mode light|deep] [--turns N] [--chars N]
           [--preview|--print-bundle|--no-open] [--include-files] [--include-transcript-path]
-          <agent:session>
+          <agent:session|N>
   absorb [--to codex|claude|gemini] [--turns N] [--chars N]
          [--preview|--print-bundle|--no-open] [--include-files] [--include-transcript-path]
-         <agent:session>
-  revive <agent:session>
+         <agent:session|N>
+  revive <agent:session|N>
   export [--to portable|codex|claude|gemini] [--mode light|deep] [--turns N] [--chars N]
          [--preview|--print-bundle] [--include-files] [--include-transcript-path]
-         <agent:session>
-  pin <agent:session>
-  alias <agent:session> [name]
+         <agent:session|N>
+  inspect [--bundle|--transcript] [--turns N] [--chars N] [--print]
+          [--include-files] [--include-transcript-path] <agent:session|N>
+  pin <agent:session|N>
+  alias <agent:session|N> [name]
   iterm-save [name]
   iterm-restore [name]
   iterm-list
   iterm-clone-current
 
+Number selectors:
+  Run `asm list` first, then use the visible row number with command targets.
+  Examples: `asm resume 3`, `asm inspect 2`, `asm handoff 5`
+
+Jira config:
+  Set `ASM_JIRA_SITE`, `ASM_JIRA_EMAIL`, and `ASM_JIRA_API_TOKEN`,
+  or save them with `asm jira config set ...`.
+
 Keys in picker:
-  left/right         Switch tabs
+  ?                  Show shortcut reference
+  f1                 Jump mode (quick move)
+  [ / ]              Cycle active tab filter
+  1 / 2 / 3          Switch preview mode
   shift-up/down      Multi-select
-  enter              Revive menu
-  ctrl-p             Toggle pin
-  ctrl-r             Reload sessions
-  ctrl-t             Toggle tags
-  tab                Tab action menu
-  ctrl-n             New tab from selection
+  enter              Resume selected session immediately
+  v                  Open revive action menu
+  /                  Enter search mode
+  esc                Leave search mode or close picker
+  p                  Toggle pin
+  r                  Reload sessions
+  t                  Toggle tags
+  m / n / u          Move / new tab / remove from tab
+  a / y / o          Alias / copy refs / cd to cwd
+  c / h / i          Clone / choose handoff / inspect
+  l                  Reuse last handoff target
+  query arg          QMD rerank + start in search mode
 
 Handoff modes:
   light              metadata + excerpt only
@@ -3457,7 +5193,22 @@ cmd_doctor() {
   local iterm_running_state="false"
   local iterm_windows_state="0"
   local apple_events_state="false"
+  local qmd_state="false"
+  local qmd_collection_state="false"
+  local qmd_doc_count="0"
+  local qmd_expected_doc_count="0"
+  local qmd_collection_files="0"
+  local qmd_current_signature="-"
+  local qmd_sync_stamp="-"
+  local qmd_stale="unknown"
+  local schema_version="-"
+  local cache_file cache_ready=0
+  cache_file="$(mktemp)"
+  if build_cache >"$cache_file" 2>/dev/null; then
+    cache_ready=1
+  fi
   print -r -- "Environment"
+  print -r -- "  asm version: $(read_version)"
   print -r -- "  shell: ${SHELL:-unknown}"
   print -r -- "  platform: $(uname -s) $(uname -m)"
   print -r -- "  shell integration: $(if [[ -n "${ASM_CMD_FILE:-}" ]]; then print active; else print inactive; fi)"
@@ -3475,10 +5226,21 @@ cmd_doctor() {
     print -r -- "  [missing] asm_runtime.py -> $ASM_RUNTIME_PY"
     missing=1
   fi
+  if store_helper_exists; then
+    print -r -- "  [ok] asm_store.py -> $ASM_STORE_PY"
+  else
+    print -r -- "  [missing] asm_store.py -> $ASM_STORE_PY"
+    missing=1
+  fi
   if selftest_helper_exists; then
     print -r -- "  [ok] asm_selftest.py -> $ASM_SELFTEST_PY"
   else
     print -r -- "  [optional-missing] asm_selftest.py -> $ASM_SELFTEST_PY"
+  fi
+  if inspect_helper_exists; then
+    print -r -- "  [ok] asm_inspect.py -> $ASM_INSPECT_PY"
+  else
+    print -r -- "  [optional-missing] asm_inspect.py -> $ASM_INSPECT_PY"
   fi
   print
   print -r -- "Dependencies"
@@ -3491,6 +5253,30 @@ cmd_doctor() {
       missing=1
     fi
   done
+  if qmd_available; then
+    qmd_state="true"
+    if qmd_collection_exists; then
+      qmd_collection_state="true"
+    fi
+    qmd_doc_count="$(qmd_doc_dir_file_count)"
+    qmd_collection_files="$(qmd_collection_file_count 2>/dev/null || print 0)"
+    qmd_sync_stamp="$(qmd_sync_stamp_value)"
+    if (( cache_ready )); then
+      qmd_expected_doc_count="$(qmd_cache_doc_count "$cache_file")"
+      qmd_current_signature="$(qmd_sync_signature_for_cache "$cache_file" 2>/dev/null || true)"
+      if [[ "$qmd_collection_state" == "true" ]] \
+        && [[ "$qmd_doc_count" == "$qmd_expected_doc_count" ]] \
+        && [[ "$qmd_collection_files" == "$qmd_expected_doc_count" ]] \
+        && [[ -n "$qmd_current_signature" ]] \
+        && [[ "$qmd_sync_stamp" == "$qmd_current_signature" ]]; then
+        qmd_stale="false"
+      else
+        qmd_stale="true"
+      fi
+    fi
+    [[ -n "$qmd_sync_stamp" ]] || qmd_sync_stamp="-"
+    [[ -n "$qmd_current_signature" ]] || qmd_current_signature="-"
+  fi
   print
   print -r -- "Platform scope"
   if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -3517,7 +5303,25 @@ cmd_doctor() {
   print -r -- "  max sessions: $ASM_MAX_SESSIONS"
   print -r -- "  cache ttl: $ASM_CACHE_TTL_SECONDS"
   print -r -- "  cache file: $ASM_SESSION_CACHE_FILE"
+  if store_helper_exists; then
+    schema_version="$(run_store_py schema-version "$ASM_DB" 2>/dev/null || print -r -- '-')"
+  fi
+  print -r -- "  schema version: $schema_version"
+  print -r -- "  qmd available: $qmd_state"
+  print -r -- "  qmd index: $ASM_QMD_INDEX_NAME"
+  print -r -- "  qmd collection: $ASM_QMD_COLLECTION_NAME ($qmd_collection_state)"
+  print -r -- "  qmd docs: $ASM_QMD_DOC_DIR (${qmd_doc_count})"
+  print -r -- "  qmd expected docs: $qmd_expected_doc_count"
+  print -r -- "  qmd collection files: $qmd_collection_files"
+  print -r -- "  qmd sync stamp: $qmd_sync_stamp"
+  print -r -- "  qmd current signature: $qmd_current_signature"
+  print -r -- "  qmd stale: $qmd_stale"
+  rm -f "$cache_file"
   return "$missing"
+}
+
+cmd_version() {
+  print -r -- "$(read_version)"
 }
 
 cmd_self_test() {
@@ -3526,6 +5330,117 @@ cmd_self_test() {
     return 1
   fi
   python3 "$ASM_SELFTEST_PY" "$ASM_SCRIPT_PATH"
+}
+
+cmd_smoke_test() {
+  if ! selftest_helper_exists; then
+    print -u2 -- "self-test file not found: $ASM_SELFTEST_PY"
+    return 1
+  fi
+
+  python3 - "$ASM_SELFTEST_PY" "$ASM_SCRIPT_PATH" <<'PY'
+import importlib.util
+import pathlib
+import sys
+import unittest
+
+test_file = pathlib.Path(sys.argv[1]).resolve()
+asm_path = pathlib.Path(sys.argv[2]).resolve()
+spec = importlib.util.spec_from_file_location("asm_selftest_cli", test_file)
+if spec is None or spec.loader is None:
+    print(f"failed to load self-test module: {test_file}", file=sys.stderr)
+    sys.exit(1)
+
+module = importlib.util.module_from_spec(spec)
+original_argv = sys.argv[:]
+sys.argv = [str(test_file), str(asm_path)]
+try:
+    spec.loader.exec_module(module)
+finally:
+    sys.argv = original_argv
+
+smoke_names = [
+    "AsmTestCase.test_doctor_reports_shell_mode",
+    "AsmTestCase.test_list_prefers_recent_claude_over_old_opencode",
+    "AsmTestCase.test_resume_without_wrapper_runs_child_shell_command_when_tty_is_present",
+    "AsmTestCase.test_codex_lookup_is_exact",
+    "AsmTestCase.test_inspect_falls_back_without_helper",
+    "AsmTestCase.test_handoff_to_claude_marks_target_workspace_trusted",
+    "AsmTestCase.test_handoff_prefers_project_hint_when_codex_cwd_is_home",
+]
+
+suite = unittest.defaultTestLoader.loadTestsFromNames(smoke_names, module)
+runner = unittest.TextTestRunner(verbosity=2)
+result = runner.run(suite)
+sys.exit(0 if result.wasSuccessful() else 1)
+PY
+}
+
+cmd_index() {
+  local action="${1:-status}"
+  shift || true
+
+  qmd_available || {
+    print -u2 -- "qmd is not installed"
+    return 1
+  }
+
+  local cache_file
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+
+  case "$action" in
+    init|update)
+      if ! ensure_qmd_index_from_cache "$cache_file"; then
+        local fallback_doc_count
+        fallback_doc_count="$(qmd_doc_dir_file_count)"
+        if ! qmd_collection_exists || [[ "$fallback_doc_count" == "0" ]]; then
+          rm -f "$cache_file"
+          print -u2 -- "failed to build qmd session index"
+          return 1
+        fi
+      fi
+      ;;
+    status)
+      ;;
+    *)
+      rm -f "$cache_file"
+      print -u2 -- "usage: asm index [init|update|status]"
+      return 1
+      ;;
+  esac
+
+  local qmd_doc_count qmd_expected_doc_count qmd_collection_state qmd_collection_files qmd_sync_stamp qmd_current_signature qmd_stale
+  qmd_doc_count="$(qmd_doc_dir_file_count)"
+  qmd_expected_doc_count="$(qmd_cache_doc_count "$cache_file")"
+  qmd_collection_state="false"
+  if qmd_collection_exists; then
+    qmd_collection_state="true"
+  fi
+  qmd_collection_files="$(qmd_collection_file_count 2>/dev/null || print 0)"
+  qmd_sync_stamp="$(qmd_sync_stamp_value)"
+  qmd_current_signature="$(qmd_sync_signature_for_cache "$cache_file" 2>/dev/null || true)"
+  if [[ "$qmd_collection_state" == "true" ]] \
+    && [[ "$qmd_doc_count" == "$qmd_expected_doc_count" ]] \
+    && [[ "$qmd_collection_files" == "$qmd_expected_doc_count" ]] \
+    && [[ -n "$qmd_current_signature" ]] \
+    && [[ "$qmd_sync_stamp" == "$qmd_current_signature" ]]; then
+    qmd_stale="false"
+  else
+    qmd_stale="true"
+  fi
+  [[ -n "$qmd_sync_stamp" ]] || qmd_sync_stamp="-"
+  [[ -n "$qmd_current_signature" ]] || qmd_current_signature="-"
+  print -r -- "qmd available: true"
+  print -r -- "qmd index: $ASM_QMD_INDEX_NAME"
+  print -r -- "qmd collection: $ASM_QMD_COLLECTION_NAME ($qmd_collection_state)"
+  print -r -- "qmd docs: $ASM_QMD_DOC_DIR (${qmd_doc_count})"
+  print -r -- "qmd expected docs: ${qmd_expected_doc_count}"
+  print -r -- "qmd collection files: ${qmd_collection_files}"
+  print -r -- "qmd sync stamp: ${qmd_sync_stamp}"
+  print -r -- "qmd current signature: ${qmd_current_signature}"
+  print -r -- "qmd stale: ${qmd_stale}"
+  rm -f "$cache_file"
 }
 
 cmd_init() {
@@ -3538,13 +5453,18 @@ function asm() {
     tmpfile="$(mktemp)" || return 1
     ASM_CMD_FILE="$tmpfile" command asm "$@"
     local ret=$?
-    if [ $ret -eq 0 ] && [ -f "$tmpfile" ]; then
+    local chain_limit=8
+    while [ $ret -eq 0 ] && [ -f "$tmpfile" ] && [ $chain_limit -gt 0 ]; do
         local result
         result="$(cat "$tmpfile")"
-        if [ -n "$result" ]; then
-            eval "$result"
+        : >"$tmpfile"
+        if [ -z "$result" ]; then
+            break
         fi
-    fi
+        eval "$result"
+        ret=$?
+        chain_limit=$((chain_limit - 1))
+    done
     rm -f "$tmpfile"
     return $ret
 }
@@ -3557,11 +5477,16 @@ function asm
     or return 1
     env ASM_CMD_FILE="$tmpfile" command asm $argv
     set -l ret $status
-    if test $ret -eq 0 -a -f "$tmpfile"
+    set -l chain_limit 8
+    while test $ret -eq 0 -a -f "$tmpfile" -a $chain_limit -gt 0
         set -l result (cat "$tmpfile")
-        if test -n "$result"
-            eval "$result"
+        printf '' > "$tmpfile"
+        if test -z "$result"
+            break
         end
+        eval "$result"
+        set ret $status
+        set chain_limit (math $chain_limit - 1)
     end
     rm -f "$tmpfile"
     return $ret
@@ -3615,16 +5540,30 @@ cmd_setup() {
 }
 
 cmd_pin() {
-  local ref
+  local ref cache_file
   ref="$(resolve_ref_argument "$@")" || return 1
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  rm -f "$cache_file"
   toggle_pin "$ref"
   print -r -- "$ref"
 }
 
 cmd_alias() {
-  local ref alias_text
+  local ref alias_text cache_file
   ref="$(resolve_ref_argument "${1:-}")" || return 1
   shift || true
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  rm -f "$cache_file"
   if [[ $# -gt 0 ]]; then
     alias_text="$*"
   else
@@ -3634,12 +5573,174 @@ cmd_alias() {
   print -r -- "$ref"
 }
 
+cmd_open() {
+  local print_only=0 list_only=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --list) list_only=1; shift ;;
+      --print) print_only=1; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+
+  local config_file
+  config_file="$(find_asm_config_file)" || {
+    print -u2 -- "asm.json not found from $(pwd) upward"
+    return 1
+  }
+
+  jq empty "$config_file" >/dev/null 2>&1 || {
+    print -u2 -- "invalid asm config: $config_file"
+    return 1
+  }
+
+  if (( list_only )); then
+    local preset_name preset_title preset_mode preset_cwd preset_entries_count
+    while IFS= read -r preset_name; do
+      [[ -n "$preset_name" ]] || continue
+      preset_title="$(preset_title_for_name "$config_file" "$preset_name")"
+      preset_mode="$(preset_open_mode_for_name "$config_file" "$preset_name")"
+      preset_cwd="$(preset_cwd_for_name "$config_file" "$preset_name")"
+      preset_entries_count="$(preset_entries_for_name "$config_file" "$preset_name" | awk 'NF{c++} END{print c+0}')"
+      print -r -- "$preset_name"
+      [[ -n "$preset_title" ]] && print -r -- "  title: $preset_title"
+      [[ -n "$preset_mode" ]] && print -r -- "  mode: $preset_mode"
+      [[ -n "$preset_cwd" ]] && print -r -- "  cwd: $preset_cwd"
+      print -r -- "  sessions: $preset_entries_count"
+    done < <(preset_names_in_config "$config_file")
+    return 0
+  fi
+
+  local preset_name="${1:-}"
+  [[ -n "$preset_name" ]] || {
+    print -u2 -- "usage: asm open [--list] [--print] <preset>"
+    return 1
+  }
+
+  preset_exists_in_config "$config_file" "$preset_name" || {
+    print -u2 -- "preset not found: $preset_name"
+    return 1
+  }
+
+  local cache_file preset_mode mode preset_title preset_cwd
+  local -a entries refs
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file"
+  entries=("${(@f)$(preset_entries_for_name "$config_file" "$preset_name")}")
+  preset_title="$(preset_title_for_name "$config_file" "$preset_name")"
+  preset_cwd="$(preset_cwd_for_name "$config_file" "$preset_name")"
+
+  (( ${#entries[@]} > 0 )) || {
+    rm -f "$cache_file"
+    print -u2 -- "preset has no sessions: $preset_name"
+    return 1
+  }
+
+  local entry ref
+  for entry in "${entries[@]}"; do
+    ref="$(resolve_preset_entry "$cache_file" "$entry" "$preset_cwd")" || {
+      rm -f "$cache_file"
+      return 1
+    }
+    refs+=("$ref")
+  done
+
+  preset_mode="$(preset_open_mode_for_name "$config_file" "$preset_name")"
+  if [[ -n "$preset_mode" ]]; then
+    mode="$preset_mode"
+  elif (( ${#refs[@]} == 1 )); then
+    mode="resume"
+  else
+    mode="tab"
+  fi
+
+  case "$mode" in
+    resume|tab|window) ;;
+    *)
+      rm -f "$cache_file"
+      print -u2 -- "invalid open mode in $config_file: $mode"
+      return 1
+      ;;
+  esac
+
+  if [[ "$mode" == "resume" && ${#refs[@]} -ne 1 ]]; then
+    rm -f "$cache_file"
+    print -u2 -- "open mode 'resume' requires exactly one session"
+    return 1
+  fi
+
+  if (( print_only )); then
+    [[ -n "$preset_title" ]] && print -r -- "# preset: $preset_title"
+    [[ -n "$preset_cwd" ]] && print -r -- "# cwd: $preset_cwd"
+    print -r -- "# mode: $mode"
+    for ref in "${refs[@]}"; do
+      open_command_for_ref "$cache_file" "$ref" "$mode" "$preset_cwd" || {
+        rm -f "$cache_file"
+        return 1
+      }
+    done
+    rm -f "$cache_file"
+    return 0
+  fi
+
+  local cmd
+  for ref in "${refs[@]}"; do
+    maybe_prepare_claude_launch_for_ref "$cache_file" "$ref" "$preset_cwd"
+    cmd="$(open_command_for_ref "$cache_file" "$ref" "resume" "$preset_cwd")" || {
+      rm -f "$cache_file"
+      return 1
+    }
+    update_last_opened "$ref"
+    case "$mode" in
+      resume)
+        emit_shell_cmd "$cmd"
+        ;;
+      tab)
+        open_command_in_iterm_tab "$cmd" || {
+          rm -f "$cache_file"
+          return 1
+        }
+        ;;
+      window)
+        open_command_in_iterm_window "$cmd" || {
+          rm -f "$cache_file"
+          return 1
+        }
+        ;;
+    esac
+  done
+
+  rm -f "$cache_file"
+}
+
+cmd_query() {
+  local query
+  query="$(clean_text "$*")"
+  [[ -n "$query" ]] || {
+    print -u2 -- "usage: asm query <terms>"
+    return 1
+  }
+  pick_ref_interactive "$query" action
+}
+
 cmd_resume() {
   local ref cache_file cmd
   ref="$(resolve_ref_argument "$@")" || return 1
   cache_file="$(mktemp)"
   build_cache >"$cache_file"
-  cmd="$(resume_command_for_ref "$cache_file" "$ref")"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  maybe_prepare_claude_launch_for_ref "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  cmd="$(resume_command_for_ref "$cache_file" "$ref")" || {
+    rm -f "$cache_file"
+    return 1
+  }
   rm -f "$cache_file"
   update_last_opened "$ref"
   emit_shell_cmd "$cmd"
@@ -3650,10 +5751,120 @@ cmd_clone() {
   ref="$(resolve_ref_argument "$@")" || return 1
   cache_file="$(mktemp)"
   build_cache >"$cache_file"
-  cmd="$(clone_command_for_ref "$cache_file" "$ref")"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  maybe_prepare_claude_launch_for_ref "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  cmd="$(clone_command_for_ref "$cache_file" "$ref")" || {
+    rm -f "$cache_file"
+    return 1
+  }
   rm -f "$cache_file"
   update_last_opened "$ref"
   emit_shell_cmd "$cmd"
+}
+
+cmd_clone_internal() {
+  local ref cache_file before_refs after_file raw_cmd agent child_ref rc
+  ref="$1"
+  cache_file="$(mktemp)"
+  before_refs="$(mktemp)"
+  after_file="$(mktemp)"
+  ASM_FORCE_REFRESH=1 build_cache >"$cache_file"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file" "$before_refs" "$after_file"
+    return 1
+  }
+  agent="${ref%%:*}"
+  refs_for_agent_from_cache "$cache_file" "$agent" | jq -R . | jq -s . >"$before_refs"
+  raw_cmd="$(raw_clone_command_for_ref "$cache_file" "$ref")" || {
+    rm -f "$cache_file" "$before_refs" "$after_file"
+    return 1
+  }
+
+  if command_requires_terminal "$raw_cmd" && [[ ! -t 0 || ! -t 1 ]]; then
+    print -u2 -- "interactive command requires a terminal; printing exact command instead"
+    print -r -- "$raw_cmd"
+    rm -f "$cache_file" "$before_refs" "$after_file"
+    return 0
+  fi
+
+  eval "$raw_cmd"
+  rc=$?
+  ASM_FORCE_REFRESH=1 build_cache >"$after_file" 2>/dev/null || true
+  child_ref="$(newest_new_ref_for_agent "$before_refs" "$after_file" "$agent" 2>/dev/null || true)"
+  if [[ -n "$child_ref" && "$child_ref" != "$ref" ]]; then
+    record_session_relation "$child_ref" "$ref" "clone" || true
+    notice "recorded clone relation: $child_ref <- $ref"
+  elif [[ "$rc" -eq 0 ]]; then
+    notice "clone finished; new session was not detected for relation tracking"
+  fi
+  rm -f "$cache_file" "$before_refs" "$after_file"
+  return "$rc"
+}
+
+cmd_relate() {
+  local child_arg="" parent_arg="" relation_kind="clone"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --parent)
+        parent_arg="${2:-}"
+        shift 2
+        ;;
+      --kind)
+        relation_kind="${2:-clone}"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        print -u2 -- "unknown relate option: $1"
+        return 2
+        ;;
+      *)
+        if [[ -z "$child_arg" ]]; then
+          child_arg="$1"
+        else
+          print -u2 -- "unexpected relate argument: $1"
+          return 2
+        fi
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$child_arg" && -n "$parent_arg" ]] || {
+    print -u2 -- "usage: asm relate <child-agent:session|N> --parent <parent-agent:session|N> [--kind clone|handoff]"
+    return 2
+  }
+
+  local cache_file child_ref parent_ref
+  cache_file="$(mktemp)"
+  ASM_FORCE_REFRESH=1 build_cache >"$cache_file"
+  child_ref="$(resolve_ref_argument "$child_arg")" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  parent_ref="$(resolve_ref_argument "$parent_arg")" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  require_ref_in_cache "$cache_file" "$child_ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  require_ref_in_cache "$cache_file" "$parent_ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
+  rm -f "$cache_file"
+  record_session_relation "$child_ref" "$parent_ref" "$relation_kind"
+  print -r -- "recorded relation: $child_ref <- $parent_ref ($relation_kind)"
 }
 
 cmd_export() {
@@ -3684,6 +5895,10 @@ cmd_export() {
   ref="$(resolve_ref_argument "$@")" || return 1
   cache_file="$(mktemp)"
   build_cache >"$cache_file"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
   if (( preview || print_bundle )); then
     build_handoff_markdown "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "${include_files:-0}" "${include_transcript_path:-0}"
     rm -f "$cache_file"
@@ -3693,6 +5908,68 @@ cmd_export() {
   rm -f "$cache_file"
   copy_to_clipboard "$out_file"
   print -r -- "$out_file"
+}
+
+cmd_inspect() {
+  local inspect_view="overview" turns="24" max_chars="20000" print_only=0 include_files=1 include_transcript_path=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --bundle) inspect_view="bundle"; shift ;;
+      --transcript) inspect_view="transcript"; shift ;;
+      --turns) turns="${2:-24}"; shift 2 ;;
+      --chars) max_chars="${2:-20000}"; shift 2 ;;
+      --print) print_only=1; shift ;;
+      --include-files) include_files=1; shift ;;
+      --no-include-files) include_files=0; shift ;;
+      --include-transcript-path) include_transcript_path=1; shift ;;
+      --no-include-transcript-path) include_transcript_path=0; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+
+  local ref cache_file inspect_file
+  ref="$(resolve_ref_argument "$@")" || return 1
+  cache_file="$(mktemp)"
+  inspect_file="$(mktemp)"
+  build_cache >"$cache_file"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file" "$inspect_file"
+    return 1
+  }
+  build_inspect_text "$cache_file" "$ref" "$inspect_view" "$turns" "$max_chars" "$include_files" "$include_transcript_path" >"$inspect_file" || {
+    rm -f "$cache_file" "$inspect_file"
+    return 1
+  }
+
+  if (( print_only )); then
+    cat "$inspect_file"
+  else
+    open_inspect_file "$inspect_file"
+  fi
+
+  rm -f "$cache_file" "$inspect_file"
+}
+
+cmd_keys() {
+  local print_only=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --print) print_only=1; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+
+  local inspect_file
+  inspect_file="$(mktemp)"
+  build_shortcuts_markdown >"$inspect_file"
+  if (( print_only )); then
+    cat "$inspect_file"
+  else
+    open_inspect_file "$inspect_file"
+  fi
+  rm -f "$inspect_file"
 }
 
 cmd_handoff() {
@@ -3728,6 +6005,10 @@ cmd_handoff() {
   ref="$(resolve_ref_argument "$@")" || return 1
   cache_file="$(mktemp)"
   build_cache >"$cache_file"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
   if (( preview || print_bundle )); then
     build_handoff_markdown "$cache_file" "$ref" "$target_agent" "$handoff_mode" "$turns" "$max_chars" "${include_files:-0}" "${include_transcript_path:-0}"
     rm -f "$cache_file"
@@ -3758,6 +6039,10 @@ cmd_revive() {
   ref="$(resolve_ref_argument "$@")" || return 1
   cache_file="$(mktemp)"
   build_cache >"$cache_file"
+  require_ref_in_cache "$cache_file" "$ref" || {
+    rm -f "$cache_file"
+    return 1
+  }
   revive_session_flow "$cache_file" "$ref"
   rm -f "$cache_file"
 }
@@ -3780,16 +6065,24 @@ cmd_render_cache() {
 
 cmd_render_active_cache() {
   [[ -f "$1" ]] || return 0
-  render_lines "$1" "$(get_active_tab_name)"
+  render_lines "$1"
 }
 
 cmd_render_picker_rows() {
   [[ -f "$1" ]] || return 0
-  render_picker_rows "$1" "$2"
+  render_picker_rows "$1" "$2" "${3:-}"
 }
 
 cmd_merge_cache_payload() {
-  merge_cache_payload "$1" "$2" "$3" "$4"
+  local relations_json="${5:-}"
+  if [[ -z "$relations_json" ]]; then
+    relations_json="$(mktemp)"
+    print -r -- "[]" >"$relations_json"
+    merge_cache_payload "$1" "$2" "$3" "$4" "$relations_json"
+    rm -f "$relations_json"
+  else
+    merge_cache_payload "$1" "$2" "$3" "$4" "$relations_json"
+  fi
 }
 
 cmd_toggle_pin_cache() {
@@ -3809,45 +6102,36 @@ cmd_move_to_tab_modal() {
 cmd_shift_active_tab() {
   local direction="$1"
   local next_tab
-  next_tab="$(shift_tab_name "$(get_active_tab_name)" "$direction")"
+  next_tab="$(shift_tab_name "$(resolved_active_tab_name)" "$direction")"
   set_active_tab_name "$next_tab"
 }
 
 cmd_header_text() {
-  picker_header_text "$(get_active_tab_name)" "${ASM_CACHE_FILE:-$ASM_SESSION_CACHE_FILE}"
+  picker_header_text "$(resolved_active_tab_name)" "${ASM_CACHE_FILE:-$ASM_SESSION_CACHE_FILE}" ""
 }
 
 cmd_prompt_text() {
-  local tab mode
-  tab="$(get_active_tab_name)"
+  local mode
   mode="$(shell_mode_label)"
   if [[ "$mode" == "integrated" ]]; then
-    printf 'asm[%s] → ' "$tab"
+    printf 'asm → '
   else
-    printf 'asm[%s|child] → ' "$tab"
+    printf 'asm[child] → '
   fi
 }
 
 cmd_picker_header() {
   local cache_file="$1"
   local state_file="$2"
-  local mode
-  mode="$(picker_state_mode "$state_file")"
-  if [[ "$mode" == "tab-target" ]]; then
-    local selected_count
-    selected_count="$(picker_state_refs "$state_file" | awk 'NF{c++} END{print c+0}')"
-    printf 'TAB ACTION · %s selected · enter apply · esc/shift-tab back' "$selected_count"
-  else
-    picker_header_text "$(get_active_tab_name)" "$cache_file"
-  fi
+  picker_header_text "$(resolved_active_tab_name)" "$cache_file" "$state_file"
 }
 
 cmd_picker_prompt() {
-  local state_file="$1"
-  local mode
-  mode="$(picker_state_mode "$state_file")"
-  if [[ "$mode" == "tab-target" ]]; then
-    printf 'tab-action> '
+  local state_file="${1:-}"
+  if [[ -n "$state_file" && "$(picker_state_mode "$state_file")" == "search" ]]; then
+    printf 'search> '
+  elif [[ -n "$state_file" && "$(picker_state_mode "$state_file")" == "revive" ]]; then
+    printf 'revive> '
   else
     cmd_prompt_text
   fi
@@ -3857,36 +6141,20 @@ cmd_picker_preview() {
   local cache_file="$1"
   local state_file="$2"
   local ref="${3:-}"
-  local mode
-  mode="$(picker_state_mode "$state_file")"
-  if [[ "$mode" != "tab-target" ]]; then
-    preview_ref "$ref"
+  if [[ "$ref" == __revive__:* ]]; then
+    local source_ref action
+    source_ref="$(picker_state_primary_ref "$state_file")"
+    action="${ref#__revive__:}"
+    ASM_CACHE_FILE="$cache_file" cmd_revive_preview "$source_ref" "$action"
     return 0
   fi
+  picker_preview_ref "$ref" "$(picker_state_preview_mode "$state_file")"
+}
 
-  local saved_count
-  saved_count="$(picker_state_refs "$state_file" | awk 'NF{c++} END{print c+0}')"
-  case "$ref" in
-    __tab_target__:__pin_on__)
-      print -r -- "Pin ${saved_count} selected session(s) so they stay at the top."
-      ;;
-    __tab_target__:__pin_off__)
-      print -r -- "Remove pin from ${saved_count} selected session(s)."
-      ;;
-    __tab_target__:All)
-      print -r -- "Remove ${saved_count} selected session(s) from any custom tab."
-      ;;
-    __tab_target__:+new)
-      print -r -- "Create a new tab name, then move ${saved_count} selected session(s) into it."
-      ;;
-    __tab_target__:* )
-      print -r -- "Move ${saved_count} selected session(s) to tab:"
-      print -r -- "${ref#__tab_target__:}"
-      ;;
-    *)
-      print -r -- "Choose a target tab."
-      ;;
-  esac
+cmd_picker_set_preview_mode() {
+  local state_file="$1"
+  local preview_mode="${2:-overview}"
+  picker_state_set_preview_mode "$state_file" "$preview_mode"
 }
 
 cmd_picker_enter_tab_target() {
@@ -3894,6 +6162,13 @@ cmd_picker_enter_tab_target() {
   shift
   [[ $# -gt 0 ]] || return 0
   picker_state_write "$state_file" "tab-target" "$@"
+}
+
+cmd_picker_enter_revive() {
+  local state_file="$1"
+  local ref="${2:-}"
+  [[ -n "$ref" && "$ref" == *:* && "$ref" != __* ]] || return 0
+  picker_state_write "$state_file" "revive" "$ref"
 }
 
 cmd_picker_leave_mode() {
@@ -3924,6 +6199,67 @@ cmd_import_iterm_tabs() {
 
 cmd_extract_current_iterm_window_snapshot() {
   extract_current_iterm_window_snapshot_file "$1" "$2" "${3:-current-window}"
+}
+
+maybe_autosave_iterm() {
+  # Autosave is best-effort and should never block normal command flow.
+  ASM_ITERM_SCAN_TIMEOUT="$ASM_AUTOSAVE_SCAN_TIMEOUT" iterm_running || return 0
+
+  if [[ -f "$ASM_AUTOSAVE_STAMP" ]]; then
+    local last_save
+    last_save="$(cat "$ASM_AUTOSAVE_STAMP" 2>/dev/null || print 0)"
+    (( ASM_NOW_EPOCH - last_save < ASM_AUTOSAVE_INTERVAL )) && return 0
+  fi
+
+  local -a recent_saves
+  recent_saves=("$ASM_ITERM_LAYOUT_DIR"/autosave-*.json(NOm[1]))
+  if (( ${#recent_saves[@]} > 0 )); then
+    local latest_save_epoch
+    latest_save_epoch="$(file_mtime_epoch "${recent_saves[1]}" 2>/dev/null || print 0)"
+    (( ASM_NOW_EPOCH - latest_save_epoch < ASM_AUTOSAVE_INTERVAL )) && return 0
+  fi
+
+  if [[ -d "$ASM_AUTOSAVE_LOCK_DIR" ]]; then
+    local lock_mtime
+    lock_mtime="$(file_mtime_epoch "$ASM_AUTOSAVE_LOCK_DIR" 2>/dev/null || print 0)"
+    if (( lock_mtime > 0 )) && (( ASM_NOW_EPOCH - lock_mtime >= ASM_AUTOSAVE_LOCK_STALE_SECONDS )); then
+      rm -rf "$ASM_AUTOSAVE_LOCK_DIR"
+    else
+      return 0
+    fi
+  fi
+
+  mkdir "$ASM_AUTOSAVE_LOCK_DIR" 2>/dev/null || return 0
+
+  local ts tmp_file snapshot_path
+  ts="$(date +%Y%m%d-%H%M%S)"
+  snapshot_path="$ASM_ITERM_LAYOUT_DIR/autosave-${ts}.json"
+  tmp_file="$(mktemp)"
+
+  if [[ -f "$snapshot_path" ]]; then
+    rm -f "$tmp_file"
+    rm -rf "$ASM_AUTOSAVE_LOCK_DIR"
+    return 0
+  fi
+
+  # Run inline so fast subcommands still persist autosaves reliably.
+  if ASM_ITERM_SCAN_TIMEOUT="$ASM_AUTOSAVE_SCAN_TIMEOUT" build_current_iterm_snapshot >"$tmp_file" 2>/dev/null; then
+    mv "$tmp_file" "$snapshot_path"
+    print -r -- "$ASM_NOW_EPOCH" >"$ASM_AUTOSAVE_STAMP"
+
+    local -a old_saves
+    old_saves=("$ASM_ITERM_LAYOUT_DIR"/autosave-*.json(NOm))
+    if (( ${#old_saves[@]} > ASM_AUTOSAVE_MAX )); then
+      local i
+      for (( i = ASM_AUTOSAVE_MAX + 1; i <= ${#old_saves[@]}; i++ )); do
+        rm -f "${old_saves[$i]}"
+      done
+    fi
+  else
+    rm -f "$tmp_file"
+  fi
+
+  rm -rf "$ASM_AUTOSAVE_LOCK_DIR"
 }
 
 cmd_iterm_save() {
@@ -4006,11 +6342,14 @@ cmd_revive_preview() {
   rec="$(record_for_ref "$cache_file" "$ref")"
   [[ -n "$rec" ]] || return 0
 
-  local title alias_text cwd updated_display summary
+  local title alias_text cwd updated_display git_summary active_slot usage_text
   title="$(jq -r '.title // ""' <<<"$rec")"
   alias_text="$(jq -r '.alias // ""' <<<"$rec")"
   cwd="$(resolve_cwd "$(jq -r '.agent' <<<"$rec")" "$(jq -r '.id' <<<"$rec")" "$(jq -r '.cwd // ""' <<<"$rec")")"
   updated_display="$(jq -r '.updated_display // ""' <<<"$rec")"
+  git_summary="$(git_summary_for_rec "$rec")"
+  active_slot="$(active_slot_for_rec "$rec")"
+  usage_text="$(claude_usage_for_rec "$rec")"
 
   print -r -- "Action:  $action"
   case "$action" in
@@ -4063,24 +6402,124 @@ cmd_revive_preview() {
   print -r -- "Session:"
   print -r -- "${alias_text:-$title}"
   print -r -- "cwd: $cwd"
+  print -r -- "git: ${git_summary:-"-"}"
+  print -r -- "live: ${active_slot:-"-"}"
+  print -r -- "usage: ${usage_text:-"-"}"
   print -r -- "updated: $updated_display"
   print
-  print -r -- "Transcript:"
-  print_recent_preview "$rec"
+  print_session_preview_block "$rec"
+}
+
+capture_iterm_tty_scan() {
+  if ! iterm_running; then
+    return 1
+  fi
+
+  run_osascript_script 2 <<'APPLESCRIPT'
+tell application "iTerm2"
+  if (count of windows) = 0 then return ""
+  set rowList to {}
+  set windowOrder to 0
+  repeat with w in windows
+    set windowOrder to windowOrder + 1
+    set tabOrder to 0
+    repeat with t in tabs of w
+      set tabOrder to tabOrder + 1
+      set sessionOrder to 0
+      repeat with s in sessions of t
+        set sessionOrder to sessionOrder + 1
+        set ttyValue to ""
+        try
+          set ttyValue to tty of s
+        end try
+        set end of rowList to "S<<<ASMSEP>>>" & (windowOrder as string) & "<<<ASMSEP>>>" & (tabOrder as string) & "<<<ASMSEP>>>" & (sessionOrder as string) & "<<<ASMSEP>>>" & ttyValue
+      end repeat
+    end repeat
+  end repeat
+  set oldTids to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to linefeed
+  set joinedText to rowList as text
+  set AppleScript's text item delimiters to oldTids
+  return joinedText
+end tell
+APPLESCRIPT
+}
+
+cmd_status() {
+  local show_all_flag="" compact_flag="" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) show_all_flag="--all"; shift ;;
+      --compact) compact_flag="--compact"; shift ;;
+      --json) json_flag="--json"; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+
+  local raw_scan
+  raw_scan="$(capture_iterm_tty_scan)" || {
+    print -u2 -- "iTerm2 is not running"
+    return 1
+  }
+
+  if [[ -z "$raw_scan" ]]; then
+    if [[ -n "$json_flag" ]]; then
+      print '[]'
+      return 0
+    fi
+    print "No iTerm2 sessions found."
+    return 0
+  fi
+
+  local cache_file
+  cache_file="$(mktemp)"
+  build_cache >"$cache_file" 2>/dev/null
+
+  run_runtime_py status "$raw_scan" "$cache_file" "$ASM_NOW_EPOCH" $show_all_flag $compact_flag $json_flag
+  local ret=$?
+  rm -f "$cache_file"
+  return $ret
 }
 
 main() {
   ensure_storage
+  load_jira_config
   debug_log "main argv=$*"
 
   local subcmd="${1:-}"
+  [[ -n "$subcmd" ]] && maybe_autosave_iterm
   case "$subcmd" in
     -h|--help|help)
       print_usage
       ;;
+    status)
+      shift
+      cmd_status "$@"
+      ;;
+    version)
+      shift
+      cmd_version "$@"
+      ;;
     doctor)
       shift
       cmd_doctor "$@"
+      ;;
+    keys)
+      shift
+      cmd_keys "$@"
+      ;;
+    index)
+      shift
+      cmd_index "$@"
+      ;;
+    jira)
+      shift
+      cmd_jira "$@"
+      ;;
+    smoke-test)
+      shift
+      cmd_smoke_test "$@"
       ;;
     self-test)
       shift
@@ -4098,6 +6537,14 @@ main() {
       shift
       print_list "$@"
       ;;
+    query)
+      shift
+      cmd_query "$@"
+      ;;
+    open)
+      shift
+      cmd_open "$@"
+      ;;
     pin)
       shift
       cmd_pin "$@"
@@ -4114,9 +6561,21 @@ main() {
       shift
       cmd_clone "$@"
       ;;
+    relate)
+      shift
+      cmd_relate "$@"
+      ;;
+    __clone)
+      shift
+      cmd_clone_internal "$@"
+      ;;
     export)
       shift
       cmd_export "$@"
+      ;;
+    inspect)
+      shift
+      cmd_inspect "$@"
       ;;
     iterm-save)
       shift
@@ -4202,9 +6661,17 @@ main() {
       shift
       cmd_picker_preview "$@"
       ;;
+    __picker_set_preview_mode)
+      shift
+      cmd_picker_set_preview_mode "$@"
+      ;;
     __picker_enter_tab_target)
       shift
       cmd_picker_enter_tab_target "$@"
+      ;;
+    __picker_enter_revive)
+      shift
+      cmd_picker_enter_revive "$@"
       ;;
     __picker_leave_mode)
       shift
@@ -4249,9 +6716,7 @@ main() {
       if [[ "$subcmd" == *:* ]]; then
         cmd_resume "$@"
       else
-        print -u2 -- "unknown subcommand: $subcmd"
-        print_usage_stderr
-        return 1
+        pick_ref_interactive "$*" action || return 1
       fi
       ;;
   esac
